@@ -10,7 +10,7 @@
 
 #include <linux/const.h>
 #include <linux/types.h>
-
+//#include <linux/compiler.h>
 #include <linux/ioctl.h>
 #include <asm/kvm.h>
 
@@ -547,6 +547,16 @@ struct kvm_dirty_log {
 	};
 };
 
+/* for KVM_GET_ACCESS_LOG */
+struct kvm_access_log {
+	__u32 slot; /* in */
+	__u32 accessed_pages; /* out */
+	union {
+		void *access_bitmap; /* out, one bit per page */
+		__u64 padding1;
+	};
+};
+
 /* for KVM_CLEAR_DIRTY_LOG */
 struct kvm_clear_dirty_log {
 	__u32 slot;
@@ -678,6 +688,7 @@ struct kvm_enable_cap {
 #define KVM_GET_API_VERSION       _IO(KVMIO,   0x00)
 #define KVM_CREATE_VM             _IO(KVMIO,   0x01) /* returns a VM fd */
 #define KVM_GET_MSR_INDEX_LIST    _IOWR(KVMIO, 0x02, struct kvm_msr_list)
+#define KVM_TEST				  _IO(KVMIO,   0x0f)
 
 #define KVM_S390_ENABLE_SIE       _IO(KVMIO,   0x06)
 /*
@@ -1212,6 +1223,9 @@ struct kvm_vfio_spapr_tce {
 					struct kvm_userspace_memory_region)
 #define KVM_SET_TSS_ADDR          _IO(KVMIO,   0x47)
 #define KVM_SET_IDENTITY_MAP_ADDR _IOW(KVMIO,  0x48, __u64)
+#define KVM_CLEAR_ACCESS_LOG	  _IO(KVMIO,   0x49)	
+#define KVM_GET_ACCESS_LOG	  _IOWR(KVMIO, 0x4a, struct kvm_access_log)
+
 #define KVM_SET_USER_MEMORY_REGION2 _IOW(KVMIO, 0x49, \
 					 struct kvm_userspace_memory_region2)
 

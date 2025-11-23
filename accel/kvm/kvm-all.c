@@ -54,6 +54,8 @@
 #include "qemu/range.h"
 
 #include "hw/boards.h"
+#include "kvm-security.h"
+#include <sched.h>
 #include "system/stats.h"
 
 /* This check must be after config-host.h is included */
@@ -77,6 +79,27 @@
 #ifndef KVM_GUESTDBG_BLOCKIRQ
 #define KVM_GUESTDBG_BLOCKIRQ 0
 #endif
+
+#define CUSTOM_DEBUG
+
+#ifdef CUSTOM_DEBUG
+#define DBG(fmt, ...) \
+    do { fprintf(stderr, fmt, ## __VA_ARGS__); } while (0)
+#else
+#define DBG(fmt, ...) \
+    do { } while (0)
+#endif
+
+#define CUSTOM_LOG
+
+#ifdef CUSTOM_LOG
+#define LOG(fd, fmt, ...) \
+    do { fprintf(fd, fmt, ## __VA_ARGS__); } while (0)
+#else
+#define LOG(fd, fmt, ...) \
+    do { } while (0)
+#endif
+
 
 /* Default num of memslots to be allocated when VM starts */
 #define  KVM_MEMSLOTS_NR_ALLOC_DEFAULT                      16
@@ -356,6 +379,38 @@ int kvm_physical_memory_addr_from_host(KVMState *s, void *ram,
 
     return ret;
 }
+
+/******************************************************************************
+ ****************************************************************************** 
+******************************************************************************/
+
+void *kvm_physical_memory_addr_to_host(KVMState *s, hwaddr gpa)
+{
+    KVMMemoryListener *kml = &s->memory_listener;
+    int i;
+    void *hva = NULL;
+
+    kvm_slots_lock(kml);
+    for (i = 0; i < s->nr_slots; i++) {
+        KVMSlot *mem = &kml->slots[i];
+
+        if (gpa >= mem->start_addr && 
+                gpa < mem->start_addr + mem->memory_size){
+
+            hva = (void *)
+                ((char *)mem->ram + gpa - mem->start_addr);
+            break;
+        }
+    }
+    kvm_slots_unlock(kml);
+
+    return hva;
+}
+
+/******************************************************************************
+ ****************************************************************************** 
+******************************************************************************/
+
 
 static int kvm_set_user_memory_region(KVMMemoryListener *kml, KVMSlot *slot, bool new)
 {
@@ -2011,10 +2066,44 @@ int kvm_set_irq(KVMState *s, int irq, int level)
     struct kvm_irq_level event;
     int ret;
 
+    /* These variables are needed only because of the way this
+        function is called, twice with the same values */
+
+    /* Cleared is true is KVM_CLEAR_ACCESS_LOG was called */
+    static bool cleared = false;
+    /* Whether the chunks were reloaded */
+    static bool reloaded = false;
     assert(kvm_async_interrupts_enabled());
 
     event.level = level;
     event.irq = irq;
+
+    if(irq == fx_irq_line && level == 1){
+        if(perf_fd == NULL)
+            perf_fd = fopen("perf_log.txt", "w");
+
+        switch(recording_state){
+            case PRE_RECORDING:
+                break;
+            case RECORDING:
+                if(!cleared){
+                    DBG("Clearing access log\n");
+                    kvm_vm_ioctl(s, KVM_CLEAR_ACCESS_LOG);
+                    cleared = true;
+                }
+                break;
+            case POST_RECORDING:
+                if(!reloaded){
+                    reload_saved_memory_chunks();
+                    reloaded = true;
+                } else reloaded = false;
+                break;
+        }
+
+        clock_gettime(CLOCK_REALTIME, &begin);
+    }
+
+    channel_state = OPENED;
     ret = kvm_vm_ioctl(s, s->irq_set_ioctl, &event);
     if (ret < 0) {
         perror("kvm_set_irq");
@@ -2512,6 +2601,7 @@ static int do_kvm_create_vm(KVMState *s, int type)
     int ret;
 
     do {
+        kvm_ioctl(s, KVM_TEST, type);
         ret = kvm_ioctl(s, KVM_CREATE_VM, type);
     } while (ret == -EINTR);
 
@@ -3054,6 +3144,537 @@ static void kvm_eat_signals(CPUState *cpu)
     } while (sigismember(&chkset, SIG_IPI));
 }
 
+/******************************************************************************
+ ****************************************************************************** 
+******************************************************************************/
+
+static bool within(hwaddr target, hwaddr addr1, hwaddr addr2)
+{
+    if(addr1 <= target && target < addr2)
+        return true;
+    return false;
+}
+
+
+static KVMSlot *find_slot_containing(hwaddr gpa, KVMState *s)
+{
+    KVMMemoryListener *kml = &s->memory_listener;
+    KVMSlot *slot = NULL;
+    int i;
+    kvm_slots_lock(kml);
+    for (i = 0; i < s->nr_slots; i++) {
+        KVMSlot *mem = &kml->slots[i];
+        if (gpa >= mem->start_addr && 
+                gpa < mem->start_addr + mem->memory_size){
+            slot = mem;
+            break;
+        }
+    }
+    kvm_slots_unlock(kml);
+    return slot;
+}
+
+/* Called with KVMMemoryListener.slots_lock held */
+static void kvm_free_slot(KVMSlot *slot)
+{
+    struct kvm_userspace_memory_region mem;
+    mem.slot = slot->slot;
+    mem.flags = slot->flags;
+    mem.guest_phys_addr = slot->start_addr;
+    mem.memory_size = 0; /* Slots can be deleted by setting 0 as memory size */
+    mem.userspace_addr = (__u64)slot->ram;
+    slot->memory_size = 0; /* This way, it can be alloc'ed again */
+    kvm_vm_ioctl(kvm_state, KVM_SET_USER_MEMORY_REGION, &mem);
+}
+
+static void kvm_set_slot(KVMSlot *slot)
+{
+    struct kvm_userspace_memory_region mem;
+    mem.slot = slot->slot;
+    mem.flags = slot->flags;
+    mem.guest_phys_addr = slot->start_addr;
+    mem.memory_size = slot->memory_size; 
+    mem.userspace_addr = (__u64)slot->ram;
+    slot->memory_size = slot->memory_size; 
+    kvm_vm_ioctl(kvm_state, KVM_SET_USER_MEMORY_REGION, &mem);
+}
+
+static hwaddr kvm_translate(CPUState *cpu, unsigned long long gva)
+{
+    struct kvm_translation translation;
+    memset(&translation, 0, sizeof(translation));
+    translation.linear_address = gva;
+    kvm_vcpu_ioctl(cpu, KVM_TRANSLATE, &translation);
+    return (hwaddr)translation.physical_address;
+}
+
+static void add_protected_memory_chunk(hwaddr gpa, 
+                                        hwaddr size, 
+                                        KVMSlot *slot,
+                                        const char *name)
+{
+    ProtectedMemoryChunk *pmc = 
+        g_malloc0(sizeof(ProtectedMemoryChunk));
+    pmc->slot = slot;
+    pmc->addr = gpa;
+    pmc->size = size;
+    pmc->name = name;
+    if(pmc_head == NULL){
+        pmc_head = pmc;
+        pmc->next = NULL;
+    }
+    else {
+        pmc->next = pmc_head;
+        pmc_head = pmc;
+    }
+}
+
+static void print_protected_memory_chunk(void)
+{
+    ProtectedMemoryChunk *pmc = pmc_head;
+    while(pmc != NULL){    
+        DBG("pmc: addr=%lx, size=%lx, name: %s\n", 
+                pmc->addr, 
+                pmc->size, 
+                pmc->name);
+        pmc = pmc->next;        
+    }
+}
+
+static int check_within_pmc(hwaddr target)
+{
+    ProtectedMemoryChunk *pmc = pmc_head;
+    while(pmc != NULL){
+        if(within(target, pmc->addr, pmc->addr + pmc->size)){
+            return IN_PMC;
+        }
+        else if(within(target, 
+                        pmc->slot->start_addr, 
+                        pmc->slot->start_addr + pmc->slot->memory_size))
+        {
+            return IN_SLOT;
+        }
+        pmc = pmc->next;
+    }
+    return NOT_IN_SLOT;
+}
+
+static void add_saved_memory_chunk(void *hva, 
+                                        hwaddr size, 
+                                        bool automatic_injection,
+                                        bool access_log)
+{
+    SavedMemoryChunk *smc = 
+        g_malloc0(sizeof(SavedMemoryChunk));
+
+    smc->inject_before_interrupt = automatic_injection;
+    smc->access_log = access_log;
+    smc->hva = hva;
+    smc->size = size;
+    smc->saved = g_malloc0(size);
+    if(!smc->saved){
+        DBG("Cannot allocate memory in add_saved_memory_chunk\n");
+        abort();
+    }
+    memcpy(smc->saved, hva, size);
+    if(smc_head == NULL){
+        smc_head = smc;
+        smc->next = NULL;
+    }
+    else {
+        smc->next = smc_head;
+        smc_head = smc;
+    }
+}
+
+/*
+*   reload saved memory chunks marked with 
+*   inject before interrupt at true
+*/
+
+static void reload_saved_memory_chunks(void)
+{
+    SavedMemoryChunk *smc = smc_head;
+    while(smc != NULL){
+        if(smc->inject_before_interrupt)
+            memcpy(smc->hva, smc->saved, smc->size);
+        smc = smc->next;
+    }
+}
+
+
+static void print_saved_memory_chunk(void)
+{
+    return;
+    /*
+    SavedMemoryChunk *smc = smc_head;
+    while(smc != NULL){
+        DBG("Saved memory chunk: addr=%p size=0x%lx\n", smc->hva, smc->size);
+        smc = smc->next;
+    }*/
+}
+
+static SavedMemoryChunk *find_saved_memory_chunk(void *hva,
+                                                            hwaddr size)
+
+{       
+    SavedMemoryChunk *smc = smc_head;
+    while(smc != NULL){
+        if(hva == smc->hva && size == smc->size)
+            return smc;
+        smc = smc->next;
+    }
+    return NULL;
+}
+
+/* Ensure to pass aligned addresses */
+static KVMSlot *make_read_only_memory_slot(hwaddr gpa, 
+                                        void *hva, 
+                                        KVMSlot *current_slot, 
+                                        unsigned long pages)
+{
+    KVMState *s = kvm_state;
+    KVMMemoryListener *kml = &s->memory_listener;
+    KVMSlot *new_slots[3]; /* pre slot | protected slot | post slot */
+    int i;
+    uint64_t total_size;
+
+    kvm_slots_lock(kml);
+
+    total_size = current_slot->memory_size;
+    kvm_free_slot(current_slot);
+
+    /* Split current slot */
+    for (i = 0; i < 3; i++){
+        new_slots[i] = kvm_alloc_slot(kml);
+        switch(i){
+        case 0:
+            new_slots[i]->ram = current_slot->ram;
+            new_slots[i]->start_addr = current_slot->start_addr;
+            new_slots[i]->memory_size = gpa - new_slots[0]->start_addr;
+            break;
+        case 1: /* protected slot case */
+            new_slots[i]->ram = hva;
+            new_slots[i]->start_addr = gpa; 
+            new_slots[i]->memory_size = pages * (PAGE_SIZE);  
+            new_slots[i]->flags = KVM_MEM_READONLY;
+            new_slots[i]->old_flags = 0;   
+            break;
+        case 2:
+            new_slots[i]->ram = ((char *)hva + (pages * (PAGE_SIZE)));
+            new_slots[i]->start_addr = gpa + (pages * (PAGE_SIZE));
+            new_slots[i]->memory_size = 
+                total_size - 
+                (new_slots[0]->memory_size + (pages * (PAGE_SIZE)));
+            break;
+        }
+        kvm_set_slot(new_slots[i]);
+    }
+
+    assert(total_size == 
+        new_slots[0]->memory_size + 
+        new_slots[1]->memory_size + 
+        new_slots[2]->memory_size
+    );
+
+    kvm_slots_unlock(kml);
+    return new_slots[1];
+}
+
+
+static void do_protect_memory_hypercall(CPUState *cpu, struct kvm_regs *regs)
+{
+    KVMState *s = kvm_state;
+    KVMSlot *current_slot;
+    hwaddr gpa; 
+    void *hva, *gva; 
+    unsigned int size;
+    char *oldhva, *newhva;
+    int offset;
+
+    gva = (void *)regs->r8;
+    gpa = kvm_translate(cpu, (unsigned long)gva);
+    size = (unsigned int)regs->r9;
+    current_slot = find_slot_containing(gpa, s);
+    hva = kvm_physical_memory_addr_to_host(s, gpa);
+
+    //DBG("\n\ndo_protect_memory_hypercall on %p and size %x\n\n", gva, size);
+    /* Aligning */
+    oldhva = (char *)hva;
+    hva = (void *)((unsigned long)hva & ~(PAGE_SIZE - 1));
+    newhva = (char *)hva;
+    offset = oldhva - newhva;
+
+    current_slot = make_read_only_memory_slot(gpa - offset, 
+                                hva, 
+                                current_slot, 
+                                1);
+    add_protected_memory_chunk(gpa, 
+                                (hwaddr) size, 
+                                current_slot,
+                                "generic protect_memory_hypercall");
+}
+
+static void do_save_memory_hypercall(CPUState *cpu, struct kvm_regs *regs)
+{
+    KVMState *s = kvm_state;
+    void *hva;
+    unsigned int size;
+    bool automatic_injection;
+
+    //DBG("do_save_memory_hypercall\n");
+    hva = kvm_physical_memory_addr_to_host(s, kvm_translate(cpu, regs->r8));
+    size = (unsigned int)regs->r9;
+    automatic_injection = (regs->r12 != 0) ? true : false;
+    //DBG("addr: %p, size %x\n", (void *)regs->r8, size);
+    //DBG("Automatic injection: %d\n", (automatic_injection ? 1:0));
+    add_saved_memory_chunk(hva, size, automatic_injection, false); 
+}
+
+static int do_compare_memory_hypercall(CPUState *cpu, struct kvm_regs *regs)
+{
+    KVMState *s = kvm_state;
+    SavedMemoryChunk *smc;
+    void *hva;
+    unsigned int size;
+
+    hva = kvm_physical_memory_addr_to_host(s, kvm_translate(cpu, regs->r8));
+    size = (unsigned int)regs->r9;
+    smc = find_saved_memory_chunk(hva, size);
+    if(smc == NULL)
+        return -1;
+    if(!memcmp(hva, smc->saved, size)){
+        DBG("Comparison OK\n");
+        return 0;
+    }
+    else {
+        DBG("Comparison NOT OK\n");
+        return 1;
+    }
+}
+
+static void do_start_monitor_hypercall(CPUState *cpu)
+{
+    struct kvm_sregs sregs;
+
+    memset(&sregs, 0, sizeof(sregs));
+    kvm_vcpu_ioctl(cpu, KVM_GET_SREGS, &sregs);
+    kernel_invariants.gdt_physical_addr = kvm_translate(cpu, sregs.gdt.base);
+    kernel_invariants.idt_physical_addr = kvm_translate(cpu, sregs.idt.base);
+    start_monitor = true;
+}
+
+static void do_end_recording_hypercall(CPUState *cpu)
+{
+    KVMState *s = kvm_state;
+    KVMMemoryListener *kml = &s->memory_listener;
+    struct kvm_access_log al;
+    int i = 0;
+    unsigned int npages;
+    //bool *bitmap_iter;
+
+    kvm_slots_lock(kml);
+
+    /* iterate all the slots */
+    for (i = 0; i < s->nr_slots; i++) {
+        KVMSlot *slot = &kml->slots[i];
+
+        if (slot->memory_size == 0) 
+            continue;
+
+        assert((slot->memory_size % PAGE_SIZE) == 0);
+        npages = (slot->memory_size / PAGE_SIZE);
+
+        /* prepare KVM_GET_ACCESS_LOG vm ioctl */
+        memset(&al, 0, sizeof(kvm_access_log));
+        al.slot = slot->slot;
+        al.access_bitmap =  g_malloc0(npages); 
+        if(al.access_bitmap == NULL){
+            DBG("cannot allocate memory\n");
+            DBG("Slot number: %d, npages: %u\n", (int)slot->slot, npages);
+            continue;
+        }
+
+        /* get access log */
+        kvm_vm_ioctl(s, KVM_GET_ACCESS_LOG, &al);
+        DBG("Slot %02d,\taccessed pages: %u,\tstarting address: %p\t,size: %lx\t, #pages: %u\n", 
+            (int)slot->slot, 
+            (unsigned int)al.accessed_pages,
+            (void *)slot->start_addr, 
+            slot->memory_size, 
+            npages);
+
+        if(al.accessed_pages == 0)
+            continue;
+
+        /* save accessed pages */
+        //bitmap_iter = (bool *)al.access_bitmap;
+        g_free(al.access_bitmap);
+    }
+
+    kvm_slots_unlock(kml);
+
+}
+
+static void *pt_monitor_body(void *opaque){
+    while(1){
+        //DBG("prova\n");
+        g_usleep(5 * G_USEC_PER_SEC);
+    }
+    return NULL;
+}
+
+static double get_elapsed_time(struct timespec *begin, struct timespec *end)
+{
+    long seconds, nanoseconds;
+    double elapsed;
+    seconds = end->tv_sec - begin->tv_sec;
+    nanoseconds = end->tv_nsec - begin->tv_nsec;
+    elapsed = seconds + nanoseconds * 1e-9;
+    return elapsed;
+}
+
+/* function for generic hypercall. It acts as a dispatcher by looking
+    at the type of hypercall. It also updates the recording state 
+    and the channel state 
+*/
+static void execute_hypercall(CPUState *cpu)
+{
+    struct kvm_regs regs;
+    unsigned int type;
+
+    if(channel_state == CLOSED){
+        DBG("Attempted hypercall with closed channel! \n");
+        return;
+    }
+
+    memset(&regs, 0, sizeof(regs));
+    kvm_vcpu_ioctl(cpu, KVM_GET_REGS, &regs);
+    type = regs.r10;
+
+    switch(type){
+    case AGENT_HYPERCALL:
+        break;
+    case PROTECT_MEMORY_HYPERCALL:
+        do_protect_memory_hypercall(cpu, &regs);
+        break;
+    case SAVE_MEMORY_HYPERCALL:
+        do_save_memory_hypercall(cpu, &regs);
+        print_saved_memory_chunk();
+        break;
+    case COMPARE_MEMORY_HYPERCALL:
+        do_compare_memory_hypercall(cpu, &regs);
+        break;
+    case SET_IRQ_LINE_HYPERCALL:
+        fx_irq_line = (int)regs.r8;
+        recording_state = RECORDING;
+        qemu_thread_create(
+            &pt_monitor, 
+            "page table monitor", 
+            pt_monitor_body,
+            NULL, QEMU_THREAD_JOINABLE
+        );
+        qemu_mutex_init(&pt_mutex);
+        /* save the entire state of guest memory */
+        break;
+    case START_MONITOR_HYPERCALL:
+        do_start_monitor_hypercall(cpu);
+        break;
+    case END_RECORDING_HYPERCALL: {
+        double elapsed;
+        clock_gettime(CLOCK_REALTIME, &end);
+        elapsed = get_elapsed_time(&begin, &end);
+        LOG(perf_fd, "Time measured: %.9f seconds.\n", elapsed);
+        if(recording_state == RECORDING){
+            recording_state = POST_RECORDING;
+            do_end_recording_hypercall(cpu);
+        }
+        channel_state = CLOSED;
+        break;  
+    } 
+    case SET_PROCESS_LIST_HYPERCALL:
+        process_list = kvm_physical_memory_addr_to_host(
+                            kvm_state,  
+                            (hwaddr)kvm_translate(cpu, regs.r8));
+        DBG("PROCESS LIST: %p\n", process_list);
+        break;
+    case PROCESS_LIST_HYPERCALL:
+        /* to check if everything is good, simply print 
+            the list of processes */
+        //DBG("%s\n", (const char *)process_list);
+        break;
+    case START_TIMER_HYPERCALL:{
+        cpu_set_t mask;
+        CPU_ZERO(&mask);
+        CPU_SET(0, &mask);
+        if (sched_setaffinity(getpid(), sizeof(cpu_set_t), &mask) == -1) {
+            DBG("sched_setaffinity");
+            assert(false);
+        }
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &begin_hypercall);
+        break;
+    }
+    case EMPTY_HYPERCALL:
+        break;
+    case STOP_TIMER_HYPERCALL:{
+        double elapsed;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end_hypercall);
+        elapsed = get_elapsed_time(&begin_hypercall, &end_hypercall);
+        if(hypercall_fd == NULL)
+            hypercall_fd = fopen("hypercall_log.txt", "a");
+        LOG(hypercall_fd, "Hypercall time: %.3f microsecs.\n", (elapsed / 100000)*1e6);
+        break;
+    }
+    default:
+        DBG("Hypercall not recognized\n");
+        break;
+    }
+}
+
+
+static void find_fx_mr(void)
+{
+    MemoryRegion *system;
+    MemoryRegion *i, *j;
+    system = get_system_memory();
+    QTAILQ_FOREACH(i, &system->subregions, subregions_link){
+        if(!strcmp(i->name, "pci")){
+            QTAILQ_FOREACH(j, &i->subregions, subregions_link){
+                if(!strcmp(j->name, "fx-mmio")){
+                    fx_mr = j;
+                    goto exit;
+                }
+            }
+        }
+    }
+    exit:
+    return;
+}
+
+/* Monitoring the IDTR and GDTR registers */
+static void check_idtr_gdtr(CPUState *cpu)
+{
+    return;
+    /*
+    struct kvm_sregs sregs;
+    hwaddr current_idtr, current_gdtr;
+    memset(&sregs, 0, sizeof(sregs));
+    kvm_vcpu_ioctl(cpu, KVM_GET_SREGS, &sregs);
+    current_idtr = kvm_translate(cpu, sregs.idt.base);
+    current_gdtr = kvm_translate(cpu, sregs.gdt.base);
+    if(current_idtr != kernel_invariants.idt_physical_addr ||
+        current_gdtr != kernel_invariants.gdt_physical_addr){
+        DBG("IDT or GDT attacked\n");
+        abort();
+    }
+    */
+}
+
+/******************************************************************************
+ ******************************************************************************      
+******************************************************************************/
+
+
 int kvm_convert_memory(hwaddr start, hwaddr size, bool to_private)
 {
     MemoryRegionSection section;
@@ -3155,8 +3776,11 @@ int kvm_cpu_exec(CPUState *cpu)
 {
     struct kvm_run *run = cpu->kvm_run;
     int ret, run_ret;
+    void *hva;
 
     trace_kvm_cpu_exec();
+    if(fx_mr == NULL)
+        find_fx_mr();
 
     if (kvm_arch_process_async_events(cpu)) {
         return EXCP_HLT;
@@ -3187,6 +3811,8 @@ int kvm_cpu_exec(CPUState *cpu)
              */
             kvm_cpu_kick_self();
         }
+        if(start_monitor)
+            check_idtr_gdtr(cpu);
 
         run_ret = kvm_vcpu_ioctl(cpu, KVM_RUN, 0);
 
@@ -3245,12 +3871,42 @@ int kvm_cpu_exec(CPUState *cpu)
             break;
         case KVM_EXIT_MMIO:
             /* Called outside BQL */
-            address_space_rw(&address_space_memory,
-                             run->mmio.phys_addr, attrs,
-                             run->mmio.data,
-                             run->mmio.len,
-                             run->mmio.is_write);
-            ret = 0;
+            /* KVM_EXIT_MMIO has now three different cases: 
+                1. Hypercall from the guest
+                2. Attempted write to a protected memory chunk 
+                3. Normal MMIO operation
+            */
+
+            if(fx_mr != NULL &&
+                run->mmio.phys_addr == fx_mr->addr + HYPERCALL_OFFSET)
+                execute_hypercall(cpu);
+            else {
+                switch(check_within_pmc(run->mmio.phys_addr)){
+                case IN_PMC:
+                    DBG("\nATTEMPTED WRITE TO PMC!!! addr = %lx\n", 
+                        (unsigned long)run->mmio.phys_addr);
+                    print_protected_memory_chunk();
+                    ret = 0;
+                    break;
+                case IN_SLOT:
+                    /* hypervisor finishes the write */
+                    assert(run->mmio.is_write);
+                    hva = kvm_physical_memory_addr_to_host(
+                            kvm_state,
+                            run->mmio.phys_addr);
+                    memcpy(hva, (void *)run->mmio.data, run->mmio.len); 
+                    ret = 0;
+                    break;
+                case NOT_IN_SLOT:
+                    address_space_rw(&address_space_memory,
+                        run->mmio.phys_addr, attrs,
+                        run->mmio.data,
+                        run->mmio.len,
+                        run->mmio.is_write);
+                    ret = 0;
+                    break;
+                }
+            }
             break;
         case KVM_EXIT_IRQ_WINDOW_OPEN:
             ret = EXCP_INTERRUPT;

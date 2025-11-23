@@ -83,6 +83,15 @@
     do { } while (0)
 #endif
 
+#define CUSTOM_DEBUG
+#ifdef CUSTOM_DEBUG
+#define DBG(fmt, ...) \
+    do { fprintf(stderr, fmt, ## __VA_ARGS__); } while (0)
+#else
+#define DBG(fmt, ...) \
+    do { } while (0)
+#endif
+
 /*
  * On older Intel CPUs, KVM uses vm86 mode to emulate 16-bit code directly.
  * In order to use vm86 mode, an EPT identity map and a TSS  are needed.
@@ -3890,7 +3899,7 @@ static int kvm_buf_set_msrs(X86CPU *cpu)
                      (uint32_t)e->index, (uint64_t)e->data);
     }
 
-    assert(ret == cpu->kvm_msr_buf->nmsrs);
+    //assert(ret == cpu->kvm_msr_buf->nmsrs);
     return 0;
 }
 
@@ -5517,6 +5526,7 @@ void kvm_arch_pre_run(CPUState *cpu, struct kvm_run *run)
     }
 
     if (!kvm_pic_in_kernel()) {
+        puts("if !kvm_pic_in_kernel entered\n");
         /* Try to inject an interrupt if the guest can accept it */
         if (run->ready_for_interrupt_injection &&
             cpu_test_interrupt(cpu, CPU_INTERRUPT_HARD) &&
@@ -5527,6 +5537,8 @@ void kvm_arch_pre_run(CPUState *cpu, struct kvm_run *run)
 
             cpu_reset_interrupt(cpu, CPU_INTERRUPT_HARD);
             irq = cpu_get_pic_interrupt(env);
+            if(irq == 10 || irq == 11)
+                puts("Injecting FX interrupt...\n");
             if (irq >= 0) {
                 struct kvm_interrupt intr;
 
@@ -6138,6 +6150,7 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
         break;
     case KVM_EXIT_DEBUG:
         DPRINTF("kvm_exit_debug\n");
+        DBG("EXIT DEBUG\n");
         bql_lock();
         ret = kvm_handle_debug(cpu, &run->debug.arch);
         bql_unlock();

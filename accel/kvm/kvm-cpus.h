@@ -9,6 +9,7 @@
 
 #ifndef KVM_CPUS_H
 #define KVM_CPUS_H
+#include "sysemu/kvm_int.h"
 
 int kvm_init_vcpu(CPUState *cpu, Error **errp);
 int kvm_cpu_exec(CPUState *cpu);
@@ -20,4 +21,6 @@ bool kvm_supports_guest_debug(void);
 int kvm_insert_breakpoint(CPUState *cpu, int type, vaddr addr, vaddr len);
 int kvm_remove_breakpoint(CPUState *cpu, int type, vaddr addr, vaddr len);
 void kvm_remove_all_breakpoints(CPUState *cpu);
+void *kvm_physical_memory_addr_to_host(KVMState *s, hwaddr guest_physical);
+
 #endif /* KVM_CPUS_H */
