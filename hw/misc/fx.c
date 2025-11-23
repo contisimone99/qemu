@@ -63,7 +63,7 @@ static void *fx_forcer_thread(void *);
 static void pci_fx_realize(PCIDevice *, Error **);
 static void pci_fx_uninit(PCIDevice *);
 static void fx_instance_init(Object *);
-static void fx_class_init(ObjectClass *, void *);
+static void fx_class_init(ObjectClass *, const void *);
 static void pci_fx_register_types(void);
 static void conf_server_init(void *);
 static void conf_server_uninit(void *);
@@ -188,8 +188,11 @@ static void *fx_forcer_thread(void *opaque)
     while (1) {
 
         /* get random bytes from urandom. */
-        getrandom(buf, sizeof(unsigned int), 0);
-
+        ssize_t ret = getrandom(buf, sizeof(unsigned int), 0); 
+        if (ret != sizeof(unsigned int)) {
+            puts("getrandom failed");
+            
+        }
         qemu_mutex_lock(&fx->conf_mutex);
         interval = fx->conf_sleep_interval;
         qemu_mutex_unlock(&fx->conf_mutex);
@@ -278,8 +281,10 @@ static void read_conf_server_callback(void *opaque)
     FxState *fx = opaque;
 
     printf("read callback\n");
-    read(fx->conn_fd, &interval, sizeof(unsigned int));
-
+    int ret= read(fx->conn_fd, &interval, sizeof(unsigned int));
+    if (ret != sizeof(unsigned int)) {
+        printf("Error reading new conf interval\n");
+    }
     qemu_mutex_lock(&fx->conf_mutex);
     fx->conf_sleep_interval = interval;
     qemu_mutex_unlock(&fx->conf_mutex);
@@ -339,7 +344,7 @@ static void fx_instance_init(Object *obj)
     fx->card_liveness = 0xdeadbeef;
 }
 
-static void fx_class_init(ObjectClass *class, void *data)
+static void fx_class_init(ObjectClass *class, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(class);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(class);

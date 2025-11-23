@@ -9,7 +9,7 @@
 
 #ifndef KVM_CPUS_H
 #define KVM_CPUS_H
-#include "sysemu/kvm_int.h"
+#include "system/kvm_int.h"
 
 int kvm_init_vcpu(CPUState *cpu, Error **errp);
 int kvm_cpu_exec(CPUState *cpu);

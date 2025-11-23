@@ -390,19 +390,22 @@ void *kvm_physical_memory_addr_to_host(KVMState *s, hwaddr gpa)
     int i;
     void *hva = NULL;
 
-    kvm_slots_lock(kml);
-    for (i = 0; i < s->nr_slots; i++) {
+    kvm_slots_lock();
+    for (i = 0; i < kml->nr_slots_allocated; i++) {
         KVMSlot *mem = &kml->slots[i];
 
-        if (gpa >= mem->start_addr && 
-                gpa < mem->start_addr + mem->memory_size){
+        if (!mem->memory_size) {
+            continue;
+        }
 
-            hva = (void *)
-                ((char *)mem->ram + gpa - mem->start_addr);
+        if (gpa >= mem->start_addr &&
+            gpa < mem->start_addr + mem->memory_size) {
+
+            hva = (void *)((char *)mem->ram + gpa - mem->start_addr);
             break;
         }
     }
-    kvm_slots_unlock(kml);
+    kvm_slots_unlock();
 
     return hva;
 }
@@ -3161,16 +3164,22 @@ static KVMSlot *find_slot_containing(hwaddr gpa, KVMState *s)
     KVMMemoryListener *kml = &s->memory_listener;
     KVMSlot *slot = NULL;
     int i;
-    kvm_slots_lock(kml);
-    for (i = 0; i < s->nr_slots; i++) {
+
+    kvm_slots_lock();
+    for (i = 0; i < kml->nr_slots_allocated; i++) {
         KVMSlot *mem = &kml->slots[i];
-        if (gpa >= mem->start_addr && 
-                gpa < mem->start_addr + mem->memory_size){
+
+        if (!mem->memory_size) {
+            continue;
+        }
+
+        if (gpa >= mem->start_addr &&
+            gpa < mem->start_addr + mem->memory_size) {
             slot = mem;
             break;
         }
     }
-    kvm_slots_unlock(kml);
+    kvm_slots_unlock();
     return slot;
 }
 
@@ -3339,7 +3348,7 @@ static KVMSlot *make_read_only_memory_slot(hwaddr gpa,
     int i;
     uint64_t total_size;
 
-    kvm_slots_lock(kml);
+    kvm_slots_lock();
 
     total_size = current_slot->memory_size;
     kvm_free_slot(current_slot);
@@ -3377,7 +3386,7 @@ static KVMSlot *make_read_only_memory_slot(hwaddr gpa,
         new_slots[2]->memory_size
     );
 
-    kvm_slots_unlock(kml);
+    kvm_slots_unlock();
     return new_slots[1];
 }
 
@@ -3471,19 +3480,18 @@ static void do_end_recording_hypercall(CPUState *cpu)
     struct kvm_access_log al;
     int i = 0;
     unsigned int npages;
-    //bool *bitmap_iter;
 
-    kvm_slots_lock(kml);
+    kvm_slots_lock();
 
     /* iterate all the slots */
-    for (i = 0; i < s->nr_slots; i++) {
+    for (i = 0; i < kml->nr_slots_allocated; i++) {
         KVMSlot *slot = &kml->slots[i];
 
-        if (slot->memory_size == 0) 
+        if (slot->memory_size == 0) {
             continue;
-
+        }
         assert((slot->memory_size % PAGE_SIZE) == 0);
-        npages = (slot->memory_size / PAGE_SIZE);
+        npages = slot->memory_size / PAGE_SIZE;
 
         /* prepare KVM_GET_ACCESS_LOG vm ioctl */
         memset(&al, 0, sizeof(kvm_access_log));
@@ -3512,7 +3520,7 @@ static void do_end_recording_hypercall(CPUState *cpu)
         g_free(al.access_bitmap);
     }
 
-    kvm_slots_unlock(kml);
+    kvm_slots_unlock();
 
 }
 
