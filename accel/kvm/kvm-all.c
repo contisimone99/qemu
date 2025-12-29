@@ -3592,7 +3592,8 @@ static void execute_hypercall(CPUState *cpu)
         double elapsed;
         clock_gettime(CLOCK_REALTIME, &end);
         elapsed = get_elapsed_time(&begin, &end);
-        LOG(perf_fd, "Time measured: %.9f seconds.\n", elapsed);
+        if(perf_fd)
+            LOG(perf_fd, "Time measured: %.9f seconds.\n", elapsed);
         if(recording_state == RECORDING){
             recording_state = POST_RECORDING;
             do_end_recording_hypercall(cpu);
@@ -3780,6 +3781,9 @@ out_unref:
     return ret;
 }
 
+static int fx_base_known;
+static hwaddr fx_base;
+
 int kvm_cpu_exec(CPUState *cpu)
 {
     struct kvm_run *run = cpu->kvm_run;
@@ -3879,43 +3883,76 @@ int kvm_cpu_exec(CPUState *cpu)
             break;
         case KVM_EXIT_MMIO:
             /* Called outside BQL */
-            /* KVM_EXIT_MMIO has now three different cases: 
-                1. Hypercall from the guest
-                2. Attempted write to a protected memory chunk 
-                3. Normal MMIO operation
-            */
 
-            if(fx_mr != NULL &&
-                run->mmio.phys_addr == fx_mr->addr + HYPERCALL_OFFSET)
+            /*
+            * 1) learn fx_base using a distinctive access:
+            *    IRQ ACK is a write at offset 0x64 (4 bytes) of the fx device.
+            */
+            if (!fx_base_known &&
+                run->mmio.is_write &&
+                run->mmio.len == 4 &&
+                ((run->mmio.phys_addr & 0xfffULL) == 0x64)) {
+
+                fx_base = run->mmio.phys_addr - 0x64;
+                fx_base_known = 1;
+                DBG("[fx] learned fx_base=0x%llx\n", (unsigned long long)fx_base);
+            }
+
+            /*
+            * 2) Hypercall: write on fx_base + 0x80 (offset HYPERCALL_OFFSET).
+            *    Always emulate the MMIO write to consume the exit, then handle it.
+            */
+            if (fx_base_known &&
+                run->mmio.is_write &&
+                run->mmio.phys_addr == fx_base + HYPERCALL_OFFSET) {
+
+                /* Emulate the MMIO as in the NOT_IN_SLOT branch (without split) */
+                address_space_rw(&address_space_memory,
+                    run->mmio.phys_addr, attrs,
+                    run->mmio.data,
+                    run->mmio.len,
+                    true);
+
+                ret = 0;
+
                 execute_hypercall(cpu);
-            else {
-                switch(check_within_pmc(run->mmio.phys_addr)){
-                case IN_PMC:
-                    DBG("\nATTEMPTED WRITE TO PMC!!! addr = %lx\n", 
-                        (unsigned long)run->mmio.phys_addr);
-                    print_protected_memory_chunk();
-                    ret = 0;
-                    break;
-                case IN_SLOT:
-                    /* hypervisor finishes the write */
-                    assert(run->mmio.is_write);
-                    hva = kvm_physical_memory_addr_to_host(
-                            kvm_state,
-                            run->mmio.phys_addr);
-                    memcpy(hva, (void *)run->mmio.data, run->mmio.len); 
-                    ret = 0;
-                    break;
-                case NOT_IN_SLOT:
-                    address_space_rw(&address_space_memory,
-                        run->mmio.phys_addr, attrs,
-                        run->mmio.data,
-                        run->mmio.len,
-                        run->mmio.is_write);
+                break;
+            }
+
+            /* --- if it is not a hypercall --- */
+            switch (check_within_pmc(run->mmio.phys_addr)) {
+            case IN_PMC:
+                DBG("\nATTEMPTED WRITE TO PMC!!! addr = %lx\n",
+                    (unsigned long)run->mmio.phys_addr);
+                print_protected_memory_chunk();
+                ret = 0;
+                break;
+
+            case IN_SLOT:
+                assert(run->mmio.is_write);
+                hva = kvm_physical_memory_addr_to_host(kvm_state, run->mmio.phys_addr);
+                if (!hva) {
+                    DBG("IN_SLOT: hva NULL for phys=0x%llx len=%d\n",
+                        (unsigned long long)run->mmio.phys_addr, run->mmio.len);
                     ret = 0;
                     break;
                 }
+                memcpy(hva, (void *)run->mmio.data, run->mmio.len);
+                ret = 0;
+                break;
+
+            case NOT_IN_SLOT:
+                address_space_rw(&address_space_memory,
+                    run->mmio.phys_addr, attrs,
+                    run->mmio.data,
+                    run->mmio.len,
+                    run->mmio.is_write);
+                ret = 0;
+                break;
             }
             break;
+
+
         case KVM_EXIT_IRQ_WINDOW_OPEN:
             ret = EXCP_INTERRUPT;
             break;
