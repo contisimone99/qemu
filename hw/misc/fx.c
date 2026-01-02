@@ -42,6 +42,9 @@ DECLARE_INSTANCE_CHECKER(FxState, FX,
 
 #define VAULT_CMD_PREPARE            0x1
 #define VAULT_CMD_DONE               0x2
+#define VAULT_CMD_FAIL               0x3   /* Step 2: guest signals validation fail */
+
+
 
 #define VAULT_ST_IDLE                0x0
 #define VAULT_ST_READY               0x1
@@ -234,24 +237,35 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         fx->vault_cmd = (uint32_t)val;
 
         if (fx->vault_cmd == VAULT_CMD_PREPARE) {
+
+            /* Enforce state machine: PREPARE only from IDLE */
+            if (fx->vault_status != VAULT_ST_IDLE) {
+                fx->vault_status = VAULT_ST_ERROR;
+                fprintf(stderr,
+                        "fx_mmio_write: VAULT_CMD_PREPARE rejected (not IDLE). status=%u\n",
+                        fx->vault_status);
+                break;
+            }
+
             if (fx->vault_opid == 0 ||
                 fx->vault_size == 0 ||
                 fx->vault_size > VAULT_MAX_PAYLOAD) {
                 fx->vault_status = VAULT_ST_ERROR;
+                fprintf(stderr,
+                        "fx_mmio_write: VAULT_CMD_PREPARE invalid params opid=%u size=%u\n",
+                        fx->vault_opid, fx->vault_size);
                 break;
             }
 
-            /* costruisci blob: [header|payload] */
+            /* build blob: [header|payload] */
             fx->vault_data_off = 0;
             fx->vault_blob_len = VAULT_HDR_SIZE + fx->vault_size;
 
-            /* header: magic, opid, len, reserved */
             vault_put_le32(&fx->vault_blob[0],  VAULT_MAGIC);
             vault_put_le32(&fx->vault_blob[4],  fx->vault_opid);
             vault_put_le32(&fx->vault_blob[8],  fx->vault_size);
             vault_put_le32(&fx->vault_blob[12], 0);
 
-            /* payload finto deterministico: 0x00,0x01,0x02... */
             for (uint32_t i = 0; i < fx->vault_size; i++) {
                 fx->vault_blob[VAULT_HDR_SIZE + i] = (uint8_t)(i & 0xFF);
             }
@@ -260,14 +274,31 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             fx->vault_status = VAULT_ST_READY;
 
             fprintf(stderr,
-                "fx_mmio_write: VAULT_CMD_PREPARE received, opid=%u size=%u blob_len=%u\n",
-                fx->vault_opid, fx->vault_size, fx->vault_blob_len);
+                    "fx_mmio_write: VAULT_CMD_PREPARE accepted opid=%u size=%u blob_len=%u\n",
+                    fx->vault_opid, fx->vault_size, fx->vault_blob_len);
 
         } else if (fx->vault_cmd == VAULT_CMD_DONE) {
-            fprintf(stderr,
-                "fx_mmio_write: VAULT_CMD_DONE received, opid=%u\n", fx->vault_opid);
 
+            fprintf(stderr,
+                    "fx_mmio_write: VAULT_CMD_DONE received opid=%u\n",
+                    fx->vault_opid);
+
+            /* invalidate blob */
             fx->vault_status = VAULT_ST_IDLE;
+            fx->vault_opid = 0;
+            fx->vault_size = 0;
+            fx->vault_data_off = 0;
+            fx->vault_blob_len = 0;
+            memset(fx->vault_blob, 0, sizeof(fx->vault_blob));
+
+        } else if (fx->vault_cmd == VAULT_CMD_FAIL) {
+
+            fprintf(stderr,
+                    "fx_mmio_write: VAULT_CMD_FAIL received opid=%u. Mark ERROR + invalidate.\n",
+                    fx->vault_opid);
+
+            /* fail-closed: mark error + invalidate */
+            fx->vault_status = VAULT_ST_ERROR;
             fx->vault_opid = 0;
             fx->vault_size = 0;
             fx->vault_data_off = 0;
@@ -276,14 +307,20 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
 
         } else {
             fx->vault_status = VAULT_ST_ERROR;
+            fprintf(stderr,
+                    "fx_mmio_write: VAULT_CMD unknown=%u -> ERROR\n",
+                    fx->vault_cmd);
         }
         break;
+
     case VAULT_SIZE_REGISTER:
         fx->vault_size = (uint32_t)val;
         break;
 
     case VAULT_DATA_RESET_REGISTER:
-        fx->vault_data_off = 0;
+        if (fx->vault_status == VAULT_ST_READY) {
+            fx->vault_data_off = 0;
+        }
         break;      
     default:
         break;
