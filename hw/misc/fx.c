@@ -43,6 +43,7 @@ DECLARE_INSTANCE_CHECKER(FxState, FX,
 #define VAULT_CMD_PREPARE            0x1
 #define VAULT_CMD_DONE               0x2
 #define VAULT_CMD_FAIL               0x3   /* Step 2: guest signals validation fail */
+#define VAULT_CMD_RESET              0x4   /* Step 3.x: recovery to IDLE */
 
 
 
@@ -280,17 +281,34 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         } else if (fx->vault_cmd == VAULT_CMD_DONE) {
 
             fprintf(stderr,
-                    "fx_mmio_write: VAULT_CMD_DONE received opid=%u\n",
-                    fx->vault_opid);
+                    "fx_mmio_write: VAULT_CMD_DONE received opid=%u (off=%u blob_len=%u status=%u)\n",
+                    fx->vault_opid, fx->vault_data_off, fx->vault_blob_len, fx->vault_status);
 
-            /* invalidate blob */
+            /*
+            * Step 3.2: accept DONE only if the guest fully consumed the blob.
+            * Fail-closed on early DONE.
+            */
+            if (fx->vault_status != VAULT_ST_READY || fx->vault_data_off != fx->vault_blob_len) {
+                fprintf(stderr,
+                        "fx_mmio_write: DONE rejected (not fully consumed). Mark ERROR + invalidate.\n");
+
+                fx->vault_status = VAULT_ST_ERROR;
+
+                fx->vault_opid = 0;
+                fx->vault_size = 0;
+                fx->vault_data_off = 0;
+                fx->vault_blob_len = 0;
+                memset(fx->vault_blob, 0, sizeof(fx->vault_blob));
+                break;
+            }
+
+            /* OK path: invalidate blob and return to IDLE */
             fx->vault_status = VAULT_ST_IDLE;
             fx->vault_opid = 0;
             fx->vault_size = 0;
             fx->vault_data_off = 0;
             fx->vault_blob_len = 0;
             memset(fx->vault_blob, 0, sizeof(fx->vault_blob));
-
         } else if (fx->vault_cmd == VAULT_CMD_FAIL) {
 
             fprintf(stderr,
@@ -304,8 +322,20 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             fx->vault_data_off = 0;
             fx->vault_blob_len = 0;
             memset(fx->vault_blob, 0, sizeof(fx->vault_blob));
+        } else if (fx->vault_cmd == VAULT_CMD_RESET) {
 
-        } else {
+            fprintf(stderr,
+                    "fx_mmio_write: VAULT_CMD_RESET received. Force IDLE + invalidate.\n");
+
+            /* Recovery: always return to IDLE and drop any in-flight blob/state */
+            fx->vault_status = VAULT_ST_IDLE;
+            fx->vault_opid = 0;
+            fx->vault_size = 0;
+            fx->vault_data_off = 0;
+            fx->vault_blob_len = 0;
+            memset(fx->vault_blob, 0, sizeof(fx->vault_blob));
+            }
+        else {
             fx->vault_status = VAULT_ST_ERROR;
             fprintf(stderr,
                     "fx_mmio_write: VAULT_CMD unknown=%u -> ERROR\n",
