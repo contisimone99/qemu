@@ -39,6 +39,25 @@ DECLARE_INSTANCE_CHECKER(FxState, FX,
 #define VAULT_DATA_RESET_REGISTER    0xB4  /* write: reset read cursor */
 #define VAULT_DATA_REGISTER          0xB8  /* read: stream u32 header+payload */
 #define VAULT_DLEN_REGISTER          0xBC  /* read: total available length (header+payload) */
+#define VAULT_ERR_REGISTER           0xC0  /* read-only: last error code */
+
+/* status bitfield */
+#define VAULT_STATUS_STATE_MASK      0x3
+#define VAULT_STATUS_STATE_IDLE      0x0
+#define VAULT_STATUS_STATE_READY     0x1
+#define VAULT_STATUS_STATE_ERROR     0x2
+#define VAULT_STATUS_BLOB_PRESENT    (1u << 2)
+#define VAULT_STATUS_BUSY            (1u << 3)
+
+/* error codes */
+#define VAULT_ERR_NONE               0
+#define VAULT_ERR_BAD_STATE          1
+#define VAULT_ERR_BAD_PARAMS         2
+#define VAULT_ERR_DONE_EARLY         3
+#define VAULT_ERR_UNKNOWN_CMD        4
+
+
+
 
 #define VAULT_CMD_PREPARE            0x1
 #define VAULT_CMD_DONE               0x2
@@ -73,7 +92,8 @@ struct FxState {
 
     uint32_t irq_status;
     uint32_t card_liveness;
-    uint32_t vault_status;
+    uint32_t vault_state;
+    uint32_t vault_err;
     uint32_t vault_cmd;
     uint32_t vault_opid;
     uint32_t vault_last_opid;
@@ -113,6 +133,15 @@ static inline void vault_put_le32(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)((v >> 24) & 0xFF);
 }
 
+static inline uint32_t fx_vault_status_word(FxState *fx)
+{
+    uint32_t st = (fx->vault_state & VAULT_STATUS_STATE_MASK);
+    if (fx->vault_blob_len != 0) {
+        st |= VAULT_STATUS_BLOB_PRESENT;
+    }
+    /* busy per ora sempre 0 */
+    return st;
+}
 
 static const MemoryRegionOps fx_mmio_ops = {
     .read = fx_mmio_read,
@@ -175,7 +204,10 @@ static uint64_t fx_mmio_read(void *opaque, hwaddr addr, unsigned size)
             val = fx->irq_status;
             break;
         case VAULT_STATUS_REGISTER:
-            val = fx->vault_status;
+            val = fx_vault_status_word(fx);
+            break;
+        case VAULT_ERR_REGISTER:
+            val = fx->vault_err;
             break;
         case VAULT_LAST_OPID_REGISTER:
             val = fx->vault_last_opid;
@@ -240,22 +272,23 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         if (fx->vault_cmd == VAULT_CMD_PREPARE) {
 
             /* Enforce state machine: PREPARE only from IDLE */
-            if (fx->vault_status != VAULT_ST_IDLE) {
-                fx->vault_status = VAULT_ST_ERROR;
-                fprintf(stderr,
-                        "fx_mmio_write: VAULT_CMD_PREPARE rejected (not IDLE). status=%u\n",
-                        fx->vault_status);
-                break;
+            if (fx->vault_state != VAULT_STATUS_STATE_IDLE) {
+                    fx->vault_state = VAULT_STATUS_STATE_ERROR;
+                    fx->vault_err = VAULT_ERR_BAD_STATE;
+                    fprintf(stderr,
+                            "fx_mmio_write: VAULT_CMD_PREPARE rejected (not IDLE). status=%u\n",
+                            fx->vault_state);
+                    break;
             }
+    
 
-            if (fx->vault_opid == 0 ||
-                fx->vault_size == 0 ||
-                fx->vault_size > VAULT_MAX_PAYLOAD) {
-                fx->vault_status = VAULT_ST_ERROR;
-                fprintf(stderr,
-                        "fx_mmio_write: VAULT_CMD_PREPARE invalid params opid=%u size=%u\n",
-                        fx->vault_opid, fx->vault_size);
-                break;
+            if (fx->vault_opid == 0 || fx->vault_size == 0 || fx->vault_size > VAULT_MAX_PAYLOAD) {
+                    fx->vault_state = VAULT_STATUS_STATE_ERROR;
+                    fx->vault_err = VAULT_ERR_BAD_PARAMS;
+                    fprintf(stderr,
+                            "fx_mmio_write: VAULT_CMD_PREPARE invalid params opid=%u size=%u\n",
+                            fx->vault_opid, fx->vault_size);
+                    break;
             }
 
             /* build blob: [header|payload] */
@@ -272,8 +305,8 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             }
 
             fx->vault_last_opid = fx->vault_opid;
-            fx->vault_status = VAULT_ST_READY;
-
+            fx->vault_state = VAULT_STATUS_STATE_READY;
+            fx->vault_err = VAULT_ERR_NONE;
             fprintf(stderr,
                     "fx_mmio_write: VAULT_CMD_PREPARE accepted opid=%u size=%u blob_len=%u\n",
                     fx->vault_opid, fx->vault_size, fx->vault_blob_len);
@@ -281,18 +314,19 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         } else if (fx->vault_cmd == VAULT_CMD_DONE) {
 
             fprintf(stderr,
-                    "fx_mmio_write: VAULT_CMD_DONE received opid=%u (off=%u blob_len=%u status=%u)\n",
-                    fx->vault_opid, fx->vault_data_off, fx->vault_blob_len, fx->vault_status);
+                    "fx_mmio_write: VAULT_CMD_DONE received opid=%u (off=%u blob_len=%u vault_state=%u)\n",
+                    fx->vault_opid, fx->vault_data_off, fx->vault_blob_len, fx->vault_state);
 
             /*
             * Step 3.2: accept DONE only if the guest fully consumed the blob.
             * Fail-closed on early DONE.
             */
-            if (fx->vault_status != VAULT_ST_READY || fx->vault_data_off != fx->vault_blob_len) {
+            if (fx->vault_state != VAULT_STATUS_STATE_READY || fx->vault_data_off != fx->vault_blob_len) {
+
                 fprintf(stderr,
                         "fx_mmio_write: DONE rejected (not fully consumed). Mark ERROR + invalidate.\n");
-
-                fx->vault_status = VAULT_ST_ERROR;
+                fx->vault_state = VAULT_STATUS_STATE_ERROR;
+                fx->vault_err = VAULT_ERR_DONE_EARLY;
 
                 fx->vault_opid = 0;
                 fx->vault_size = 0;
@@ -303,7 +337,8 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             }
 
             /* OK path: invalidate blob and return to IDLE */
-            fx->vault_status = VAULT_ST_IDLE;
+            fx->vault_state = VAULT_STATUS_STATE_IDLE;
+            fx->vault_err = VAULT_ERR_NONE;
             fx->vault_opid = 0;
             fx->vault_size = 0;
             fx->vault_data_off = 0;
@@ -316,7 +351,8 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
                     fx->vault_opid);
 
             /* fail-closed: mark error + invalidate */
-            fx->vault_status = VAULT_ST_ERROR;
+            fx->vault_state = VAULT_STATUS_STATE_ERROR;
+            fx->vault_err = VAULT_ERR_BAD_PARAMS;
             fx->vault_opid = 0;
             fx->vault_size = 0;
             fx->vault_data_off = 0;
@@ -328,7 +364,8 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
                     "fx_mmio_write: VAULT_CMD_RESET received. Force IDLE + invalidate.\n");
 
             /* Recovery: always return to IDLE and drop any in-flight blob/state */
-            fx->vault_status = VAULT_ST_IDLE;
+            fx->vault_state = VAULT_STATUS_STATE_IDLE;
+            fx->vault_err = VAULT_ERR_NONE;
             fx->vault_opid = 0;
             fx->vault_size = 0;
             fx->vault_data_off = 0;
@@ -336,7 +373,9 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             memset(fx->vault_blob, 0, sizeof(fx->vault_blob));
             }
         else {
-            fx->vault_status = VAULT_ST_ERROR;
+            
+            fx->vault_state = VAULT_STATUS_STATE_ERROR;
+            fx->vault_err = VAULT_ERR_UNKNOWN_CMD;
             fprintf(stderr,
                     "fx_mmio_write: VAULT_CMD unknown=%u -> ERROR\n",
                     fx->vault_cmd);
@@ -348,7 +387,7 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         break;
 
     case VAULT_DATA_RESET_REGISTER:
-        if (fx->vault_status == VAULT_ST_READY) {
+        if (fx->vault_state == VAULT_STATUS_STATE_READY) {
             fx->vault_data_off = 0;
         }
         break;      
@@ -531,7 +570,8 @@ static void fx_instance_init(Object *obj)
 {
     FxState *fx = FX(obj);
     fx->card_liveness = 0xdeadbeef;
-    fx->vault_status = VAULT_ST_IDLE;
+    fx->vault_state = VAULT_STATUS_STATE_IDLE;
+    fx->vault_err   = VAULT_ERR_NONE;
     fx->vault_cmd = 0;
     fx->vault_opid = 0;
     fx->vault_last_opid = 0;
