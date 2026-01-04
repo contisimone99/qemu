@@ -117,6 +117,7 @@ struct FxState {
     /* Step5: virtio-mem plumbing */
     void     *vault_ram_ptr;      /* host ptr to memory-backend-ram */
     uint64_t vault_ram_size;
+    MemoryRegion *vault_mr;       /* MemoryRegion of /objects/vaultmem */
     DeviceState *vault_vmem_dev;  /* virtio-mem-pci device (id=vault0) */
 
 
@@ -148,6 +149,7 @@ static void fx_vault_step5_detach_and_invalidate(FxState *);
 static uint64_t fx_round_up_u64(uint64_t, uint64_t);
 static void fx_vault_step5_resolve(FxState *);
 static void fx_vault_step5_ensure_resolved(FxState *);
+static void fx_vault_step5_set_ept_ro(FxState *, bool);
 
 static inline void vault_put_le32(uint8_t *p, uint32_t v)
 {
@@ -336,6 +338,11 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
 
             /* copy into backend RAM (offset 0) */
             memcpy(fx->vault_ram_ptr, fx->vault_blob, fx->vault_blob_len);
+            /*
+             * Step 5 hardening: set EPT RO before hotplugging via virtio-mem.
+             * This ensures memslots are created as READONLY (EPT RO) from the start.
+             */
+            fx_vault_step5_set_ept_ro(fx, true);
 
             /* attach only what is needed (rounded to virtio-mem block size) */
             uint64_t req = fx_round_up_u64((uint64_t)fx->vault_blob_len, VAULT_VMEM_BLOCK_SIZE);
@@ -564,6 +571,23 @@ static bool fx_vault_step5_ready(FxState *fx)
     return fx->vault_ram_ptr && fx->vault_vmem_dev;
 }
 
+static void fx_vault_step5_set_ept_ro(FxState *fx, bool ro)
+{
+    fx_vault_step5_ensure_resolved(fx);
+
+    if (!fx->vault_mr) {
+        fprintf(stderr, "fx: vault_mr not resolved, cannot set EPT RO=%d\n", ro ? 1 : 0);
+        return;
+    }
+
+    /*
+     * This toggles MemoryRegion->readonly. Under KVM, that maps to KVM_MEM_READONLY
+     * on the memslot(s), i.e. EPT read-only from the guest POV.
+     */
+    memory_region_set_readonly(fx->vault_mr, ro);
+    fprintf(stderr, "fx: vaultmem MemoryRegion readonly=%d (EPT RO)\n", ro ? 1 : 0);
+}
+
 
 static void fx_vault_set_requested_size(FxState *fx, uint64_t req)
 {
@@ -633,6 +657,7 @@ static void fx_vault_step5_resolve(FxState *fx)
             fx->vault_ram_size = 0;
             goto out_memdev;
         }
+        fx->vault_mr = mr;
 
         fx->vault_ram_ptr = memory_region_get_ram_ptr(mr);
         fx->vault_ram_size = memory_region_size(mr);
@@ -641,6 +666,7 @@ static void fx_vault_step5_resolve(FxState *fx)
             fprintf(stderr, "fx: memdev resolved but ram_ptr/size invalid (ptr=%p size=%" PRIu64 ")\n",
                     fx->vault_ram_ptr, fx->vault_ram_size);
             fx->vault_ram_ptr = NULL;
+            fx->vault_mr = NULL;
             fx->vault_ram_size = 0;
             goto out_memdev;
         }
@@ -684,6 +710,9 @@ static void fx_vault_step5_detach_and_invalidate(FxState *fx)
 {
     /* detach region */
     fx_vault_set_requested_size(fx, 0);
+    
+    /* once detached, no need to keep it RO */
+    fx_vault_step5_set_ept_ro(fx, false);
 
     /* invalidate vault state */
     fx->vault_opid = 0;
@@ -761,6 +790,8 @@ static void fx_instance_init(Object *obj)
     fx->vault_size = 0;
     fx->vault_data_off = 0;
     fx->vault_blob_len = 0;
+    fx->vault_mr = NULL;
+
     memset(fx->vault_blob, 0, sizeof(fx->vault_blob));
 }
 
