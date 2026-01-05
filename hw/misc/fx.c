@@ -57,7 +57,7 @@ DECLARE_INSTANCE_CHECKER(FxState, FX,
 /* Step 5 (virtio-mem) */
 #define VAULT_VMEM_ID_DEFAULT        "vault0"
 #define VAULT_MEMDEV_ID_DEFAULT      "vaultmem"
-#define VAULT_VMEM_BLOCK_SIZE        (2 * 1024 * 1024ULL) /* must match runall.sh block-size */
+#define VAULT_VMEM_BLOCK_SIZE        (128 * 1024 * 1024ULL) /* must match runall.sh block-size */
 
 
 /* error codes */
