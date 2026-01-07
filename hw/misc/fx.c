@@ -36,15 +36,15 @@ DECLARE_INSTANCE_CHECKER(FxState, FX,
 #define INTERRUPT_RAISE_REGISTER    0x60
 #define INTERRUPT_ACK_REGISTER      0x64
 
-#define VAULT_OPID_REGISTER          0xA0
-#define VAULT_CMD_REGISTER           0xA4
-#define VAULT_STATUS_REGISTER        0xA8
-#define VAULT_LAST_OPID_REGISTER     0xAC
-#define VAULT_SIZE_REGISTER          0xB0  /* write: payload size required */
-#define VAULT_DATA_RESET_REGISTER    0xB4  /* write: reset read cursor */
-#define VAULT_DATA_REGISTER          0xB8  /* read: stream u32 header+payload */
-#define VAULT_DLEN_REGISTER          0xBC  /* read: total available length (header+payload) */
-#define VAULT_ERR_REGISTER           0xC0  /* read-only: last error code */
+
+#define VAULT_CMD_REGISTER           0xA0
+#define VAULT_STATUS_REGISTER        0xA4
+#define VAULT_LAST_OPID_REGISTER     0xA8
+#define VAULT_SIZE_REGISTER          0xAC  /* write: payload size required */
+#define VAULT_DATA_RESET_REGISTER    0xB0  /* write: reset read cursor */
+#define VAULT_DATA_REGISTER          0xB4  /* read: stream u32 header+payload */
+#define VAULT_DLEN_REGISTER          0xB8  /* read: total available length (header+payload) */
+#define VAULT_ERR_REGISTER           0xBC  /* read-only: last error code */
 
 /* status bitfield */
 #define VAULT_STATUS_STATE_MASK      0x3
@@ -108,6 +108,7 @@ struct FxState {
     uint32_t vault_cmd;
     uint32_t vault_opid;
     uint32_t vault_last_opid;
+    uint32_t vault_next_opid;
     uint32_t vault_size;
     uint32_t vault_data_off;      /* Step1-4 cursor: no longer used in Step5 */
     uint32_t vault_blob_len;
@@ -241,10 +242,6 @@ static uint64_t fx_mmio_read(void *opaque, hwaddr addr, unsigned size)
         case VAULT_DLEN_REGISTER:
             val = fx->vault_blob_len;
             break;
-        case VAULT_DATA_REGISTER:
-            /* Step 5: no streaming anymore */
-            val = 0;
-            break;
         default:
             break;
         }
@@ -277,9 +274,7 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
     case INTERRUPT_ACK_REGISTER:
         fx_lower_irq(fx, val);
         break;
-    case VAULT_OPID_REGISTER:
-    fx->vault_opid = (uint32_t)val;
-        break;
+
 
     case VAULT_CMD_REGISTER:
         fx->vault_cmd = (uint32_t)val;
@@ -297,7 +292,7 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             }
     
 
-            if (fx->vault_opid == 0 || fx->vault_size == 0 || fx->vault_size > VAULT_MAX_PAYLOAD) {
+            if (fx->vault_size == 0 || fx->vault_size > VAULT_MAX_PAYLOAD) {
                     fx->vault_state = VAULT_STATUS_STATE_ERROR;
                     fx->vault_err = VAULT_ERR_BAD_PARAMS;
                     fprintf(stderr,
@@ -309,7 +304,7 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             /* build blob: [header|payload] */
             fx->vault_data_off = 0;
             fx->vault_blob_len = VAULT_HDR_SIZE + fx->vault_size;
-
+            fx->vault_opid = ++fx->vault_next_opid;
             vault_put_le32(&fx->vault_blob[0],  VAULT_MAGIC);
             vault_put_le32(&fx->vault_blob[4],  fx->vault_opid);
             vault_put_le32(&fx->vault_blob[8],  fx->vault_size);
@@ -787,6 +782,7 @@ static void fx_instance_init(Object *obj)
     fx->vault_cmd = 0;
     fx->vault_opid = 0;
     fx->vault_last_opid = 0;
+    fx->vault_next_opid = 0;
     fx->vault_size = 0;
     fx->vault_data_off = 0;
     fx->vault_blob_len = 0;
