@@ -39,6 +39,8 @@
 #define EMPTY_HYPERCALL             11
 #define STOP_TIMER_HYPERCALL        12
 
+#define BOOTSTRAP_INFO_HYPERCALL 13
+
 typedef enum channel_state { 
     CLOSED,
     OPENED
@@ -107,5 +109,20 @@ MonitoredPageTableEntry *pt_head;
 FILE *perf_fd, *hypercall_fd;
 struct timespec begin, end;
 struct timespec begin_hypercall, end_hypercall;
+
+/* variables for data received from self-unload guest module*/
+typedef struct FxBootstrapInfo {
+    uint64_t init_task_addr;
+    uint32_t off_tasks;
+    uint32_t off_pid;
+    uint32_t off_comm;
+    uint32_t comm_len;
+    uint32_t task_struct_size;
+    uint32_t abi;
+    uint32_t reserved;
+} __attribute__((packed)) FxBootstrapInfo;
+
+static FxBootstrapInfo fx_bootstrap_info;
+static bool fx_bootstrap_valid;
 
 #endif

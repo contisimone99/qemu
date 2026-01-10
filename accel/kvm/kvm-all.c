@@ -80,9 +80,9 @@
 #define KVM_GUESTDBG_BLOCKIRQ 0
 #endif
 
-#define CUSTOM_DEBUG
+#define CUSTOM_DEBUG 1
 
-#ifdef CUSTOM_DEBUG
+#ifdef CUSTOM_DEBUG 
 #define DBG(fmt, ...) \
     do { fprintf(stderr, fmt, ## __VA_ARGS__); } while (0)
 #else
@@ -3559,7 +3559,12 @@ static void execute_hypercall(CPUState *cpu)
     memset(&regs, 0, sizeof(regs));
     kvm_vcpu_ioctl(cpu, KVM_GET_REGS, &regs);
     type = regs.r10;
-
+    fprintf(stderr, "[FX] execute_hypercall: type=%u r8=0x%llx r9=%llu r10=0x%llx\n",
+        type,
+        (unsigned long long)regs.r8,
+        (unsigned long long)regs.r9,
+        (unsigned long long)regs.r10);
+    fflush(stderr);
     switch(type){
     case AGENT_HYPERCALL:
         break;
@@ -3601,6 +3606,34 @@ static void execute_hypercall(CPUState *cpu)
         channel_state = CLOSED;
         break;  
     } 
+    case BOOTSTRAP_INFO_HYPERCALL: {
+        void *guest_ptr = kvm_physical_memory_addr_to_host(
+            kvm_state,
+            (hwaddr)kvm_translate(cpu, regs.r8)
+        );
+
+        if (!guest_ptr) {
+            fprintf(stderr, "[FX] BOOTSTRAP_INFO: guest_ptr NULL\n");
+            fflush(stderr);
+            break;
+        }
+
+        memcpy(&fx_bootstrap_info, guest_ptr, sizeof(fx_bootstrap_info));
+        fx_bootstrap_valid = true;
+
+        fprintf(stderr,
+            "[FX] BOOTSTRAP_INFO received: init_task=0x%llx off_tasks=0x%x off_pid=0x%x off_comm=0x%x comm_len=%u task_struct_size=%u abi=%u\n",
+            (unsigned long long)fx_bootstrap_info.init_task_addr,
+            fx_bootstrap_info.off_tasks,
+            fx_bootstrap_info.off_pid,
+            fx_bootstrap_info.off_comm,
+            fx_bootstrap_info.comm_len,
+            fx_bootstrap_info.task_struct_size,
+            fx_bootstrap_info.abi
+        );
+        fflush(stderr);
+        break;
+    }
     case SET_PROCESS_LIST_HYPERCALL:
         process_list = kvm_physical_memory_addr_to_host(
                             kvm_state,  
@@ -3635,7 +3668,8 @@ static void execute_hypercall(CPUState *cpu)
         break;
     }
     default:
-        DBG("Hypercall not recognized\n");
+        fprintf(stderr, "[FX] unknown hypercall type=%u\n", type);
+        fflush(stderr);
         break;
     }
 }
@@ -3883,9 +3917,23 @@ int kvm_cpu_exec(CPUState *cpu)
             break;
         case KVM_EXIT_MMIO:
             /* Called outside BQL */
-
             /*
-            * 1) learn fx_base using a distinctive access:
+            * 0) Learn fx_base from the hypercall trigger itself:
+            *    hypercall is a qword write at offset 0x80.
+            *    This removes the need for a dummy write at 0x64.
+            */
+            if (!fx_base_known &&
+                run->mmio.is_write &&
+                run->mmio.len == 8 &&
+                ((run->mmio.phys_addr & 0xfffULL) == 0x80)) {
+
+                fx_base = run->mmio.phys_addr - 0x80;
+                fx_base_known = 1;
+                DBG("[fx] learned fx_base via hypercall write: 0x%llx\n",
+                    (unsigned long long)fx_base);
+            }
+            /*
+            * 1) fallback: learn fx_base using a distinctive access:
             *    IRQ ACK is a write at offset 0x64 (4 bytes) of the fx device.
             */
             if (!fx_base_known &&
