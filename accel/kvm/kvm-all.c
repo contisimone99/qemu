@@ -3420,15 +3420,7 @@ static int fx_step1_cap_xcrs(void)
 }
 
 
-static int fx_step1_count_cpus(void)
-{
-    int n = 0;
-    CPUState *c;
-    CPU_FOREACH(c) {
-        n++;
-    }
-    return n;
-}
+
 
 /* Non-target vCPUs will block inside kvm_cpu_exec when pause is on */
 static void fx_step1_pause_others(CPUState *target)
@@ -3440,21 +3432,42 @@ static void fx_step1_pause_others(CPUState *target)
 
     qemu_mutex_lock(&fx_step1_pause_mtx);
     fx_step1_target_cpu = target;
+    fx_step1_paused_count = 0;
     fx_step1_pause_on = 1;
 
     /* Kick others so they exit KVM_RUN quickly and see the pause flag */
     CPU_FOREACH(c) {
         if (c != target) {
+            /*
+            * Force other vCPUs to leave KVM_RUN quickly so they can reach the
+            * parking point in kvm_cpu_exec.
+            */
             qatomic_set(&c->exit_request, 1);
-            kvm_cpu_kick(c);
+            cpu_exit(c);
+
+            if (kvm_immediate_exit) {
+                kvm_cpu_kick(c);      /* sets kvm_run->immediate_exit = 1 */
+            } else {
+                qemu_cpu_kick(c);     /* fallback if KVM_CAP_IMMEDIATE_EXIT not available */
+            }
         }
     }
-
-    total = fx_step1_count_cpus();
-    need  = (total > 0) ? (total - 1) : 0;
+        total = 0;
+        CPU_FOREACH(c) {
+            if (c != target) {
+                /* count only CPUs that exist and are not explicitly stopped */
+                if (!c->stopped) {
+                    total++;
+                }
+            }
+        }
+        need = total;
 
     /* Wait until all other vCPUs are parked */
     while (fx_step1_paused_count < need) {
+        fprintf(stderr, "[FX] Step1: waiting paused_count=%d need=%d\n",
+            fx_step1_paused_count, need);
+        fflush(stderr);
         qemu_cond_wait(&fx_step1_pause_cv, &fx_step1_pause_mtx);
     }
 
@@ -3511,10 +3524,14 @@ static int fx_step1_start_takeover(CPUState *cpu)
     struct kvm_sregs sregs;
     struct kvm_fpu   fpu;
     void *vault_hva;
-
-    if (!fx_step1_armed) {
+    fprintf(stderr, "[FX] Step1: start_takeover entered cpu_index=%d vault_gpa=0x%llx size=0x%llx\n",
+        cpu->cpu_index,
+        (unsigned long long)fx_step1_vault_gpa_base,
+        (unsigned long long)fx_step1_vault_size);
+    fflush(stderr);
+    /*if (!fx_step1_armed) {
         return 0;
-    }
+    }*/
 
     /* Vault parameters must be set */
     if (fx_step1_vault_gpa_base == 0 || fx_step1_vault_size < (FX_STEP1_PGT_OFF + FX_STEP1_PGT_BYTES + 0x1000)) {
@@ -4144,15 +4161,16 @@ int kvm_cpu_exec(CPUState *cpu)
             check_idtr_gdtr(cpu);
 
         /*
-         * FX Step1: if the vault is armed, start takeover on this vCPU.
-         * We choose a single target vCPU (CPU0) for Step1 simplicity.
-         */
-        if (fx_step1_armed) {
-            /* target policy: run on CPU0 only */
-            if (cpu->cpu_index == 0) {
-                fx_step1_start_takeover(cpu);
-            }
+        * FX Step1: start takeover on the first vCPU that observes arming.
+        * Use an atomic claim so only one vCPU can start it.
+        */
+        int claimed = (qatomic_cmpxchg(&fx_step1_armed, 1, 0) == 1);
+        if (claimed) {
+            fprintf(stderr, "[FX] Step1: claimed by cpu_index=%d\n", cpu->cpu_index);
+            fflush(stderr);
+            fx_step1_start_takeover(cpu);
         }
+
         
         run_ret = kvm_vcpu_ioctl(cpu, KVM_RUN, 0);
 
