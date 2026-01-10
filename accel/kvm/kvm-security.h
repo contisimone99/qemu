@@ -123,6 +123,71 @@ typedef struct FxBootstrapInfo {
 } __attribute__((packed)) FxBootstrapInfo;
 
 static FxBootstrapInfo fx_bootstrap_info;
-static bool fx_bootstrap_valid;
+extern bool fx_bootstrap_valid;
+
+/* =========================
+ * FX Step 1: Hello monitor
+ * takeover + return
+ * ========================= */
+
+/* I/O port used by the vault payload to signal completion */
+#define FX_MAGIC_PORT_DONE           0x00F1
+
+/* We execute the payload at a fixed VA using a temporary CR3 built in-vault */
+#define FX_STEP1_EXEC_VA             0x0000000040000000ULL /* 1 GiB VA */
+#define FX_STEP1_ENTRY_OFF           0x0000ULL
+#define FX_STEP1_STACK_OFF           0x4000ULL
+#define FX_STEP1_STACK_SIZE          0x1000ULL
+
+/* Where we build temporary page tables inside vault */
+#define FX_STEP1_PGT_OFF             0x8000ULL /* must be 4K-aligned */
+#define FX_STEP1_PGT_BYTES           0x3000ULL /* PML4+PDPT+PD */
+#ifndef X86_EFLAGS_IF
+#define X86_EFLAGS_IF (1ULL << 9)
+#endif
+/*
+ * These are set by the FX device when the vault is attached + payload written.
+ * They live in kvm-all so that the vCPU thread can run takeover without
+ * additional plumbing.
+ */
+uint64_t fx_step1_vault_gpa_base = 0;
+uint64_t fx_step1_vault_size     = 0;
+volatile int fx_step1_armed      = 0;
+
+/* Request from KVM side to detach vault after step completion */
+volatile int fx_step1_detach_req = 0;
+
+/* Stop-the-world coordination for "stop other vCPUs" */
+static QemuMutex fx_step1_pause_mtx;
+static QemuCond  fx_step1_pause_cv;
+static volatile int fx_step1_pause_on = 0;
+static CPUState *fx_step1_target_cpu  = NULL;
+static int fx_step1_paused_count      = 0;
+
+typedef struct FxStep1Saved {
+    struct kvm_regs  regs;
+    struct kvm_sregs sregs;
+
+    /* Legacy fallback */
+    struct kvm_fpu   fpu;
+    int have_fpu;
+
+    /* Extended fpstate (older API) */
+    struct kvm_xsave xsave;
+    int have_xsave;
+
+    /* XCR0 etc. */
+    struct kvm_xcrs xcrs;
+    int have_xcrs;
+
+    int valid;
+} FxStep1Saved;
+
+static FxStep1Saved fx_step1_saved = {0};
+
+/* Forward decl: implemented in fx device (fx.c) */
+void fx_vault_step1_detach_from_kvmall(void);
+extern void fx_step1_arm_from_kvmall(void);
+
 
 #endif

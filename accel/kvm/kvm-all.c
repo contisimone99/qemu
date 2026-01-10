@@ -3390,6 +3390,275 @@ static KVMSlot *make_read_only_memory_slot(hwaddr gpa,
     return new_slots[1];
 }
 
+/* Initialize mutex/cond once */
+static void fx_step1_init_sync_once(void)
+{
+    static int inited = 0;
+    if (!inited) {
+        qemu_mutex_init(&fx_step1_pause_mtx);
+        qemu_cond_init(&fx_step1_pause_cv);
+        inited = 1;
+    }
+}
+
+static int fx_step1_cap_xsave(void)
+{
+#ifdef KVM_CAP_XSAVE
+    return kvm_check_extension(kvm_state, KVM_CAP_XSAVE) > 0;
+#else
+    return 0;
+#endif
+}
+
+static int fx_step1_cap_xcrs(void)
+{
+#ifdef KVM_CAP_XCRS
+    return kvm_check_extension(kvm_state, KVM_CAP_XCRS) > 0;
+#else
+    return 0;
+#endif
+}
+
+
+static int fx_step1_count_cpus(void)
+{
+    int n = 0;
+    CPUState *c;
+    CPU_FOREACH(c) {
+        n++;
+    }
+    return n;
+}
+
+/* Non-target vCPUs will block inside kvm_cpu_exec when pause is on */
+static void fx_step1_pause_others(CPUState *target)
+{
+    CPUState *c;
+    int total, need;
+
+    fx_step1_init_sync_once();
+
+    qemu_mutex_lock(&fx_step1_pause_mtx);
+    fx_step1_target_cpu = target;
+    fx_step1_pause_on = 1;
+
+    /* Kick others so they exit KVM_RUN quickly and see the pause flag */
+    CPU_FOREACH(c) {
+        if (c != target) {
+            qatomic_set(&c->exit_request, 1);
+            kvm_cpu_kick(c);
+        }
+    }
+
+    total = fx_step1_count_cpus();
+    need  = (total > 0) ? (total - 1) : 0;
+
+    /* Wait until all other vCPUs are parked */
+    while (fx_step1_paused_count < need) {
+        qemu_cond_wait(&fx_step1_pause_cv, &fx_step1_pause_mtx);
+    }
+
+    qemu_mutex_unlock(&fx_step1_pause_mtx);
+}
+
+static void fx_step1_resume_others(void)
+{
+    fx_step1_init_sync_once();
+
+    qemu_mutex_lock(&fx_step1_pause_mtx);
+    fx_step1_pause_on = 0;
+    fx_step1_target_cpu = NULL;
+    qemu_cond_broadcast(&fx_step1_pause_cv);
+    qemu_mutex_unlock(&fx_step1_pause_mtx);
+}
+
+/* Build temporary page tables in-vault mapping EXEC_VA -> vault_gpa_base using 2MiB page */
+static void fx_step1_build_pagetables(void *vault_hva, uint64_t vault_gpa_base)
+{
+    uint8_t *base = (uint8_t *)vault_hva;
+
+    uint64_t *pml4 = (uint64_t *)(base + FX_STEP1_PGT_OFF + 0x0000);
+    uint64_t *pdpt = (uint64_t *)(base + FX_STEP1_PGT_OFF + 0x1000);
+    uint64_t *pd   = (uint64_t *)(base + FX_STEP1_PGT_OFF + 0x2000);
+
+    memset(pml4, 0, FX_STEP1_PGT_BYTES);
+
+    /* Indices for FX_STEP1_EXEC_VA */
+    const uint64_t pml4_i = (FX_STEP1_EXEC_VA >> 39) & 0x1FF;
+    const uint64_t pdpt_i = (FX_STEP1_EXEC_VA >> 30) & 0x1FF;
+    const uint64_t pd_i   = (FX_STEP1_EXEC_VA >> 21) & 0x1FF;
+
+    /* Physical addresses of paging structures (guest physical == vault_gpa_base + offsets) */
+    const uint64_t pdpt_pa = vault_gpa_base + FX_STEP1_PGT_OFF + 0x1000;
+    const uint64_t pd_pa   = vault_gpa_base + FX_STEP1_PGT_OFF + 0x2000;
+
+    const uint64_t flags = 0x003ULL; /* Present | RW */
+    pml4[pml4_i] = pdpt_pa | flags;
+    pdpt[pdpt_i] = pd_pa   | flags;
+
+    /*
+     * 2MiB page mapping:
+     * PD entry with PS=1 maps [VA .. VA+2MiB) -> [PA .. PA+2MiB)
+     */
+    const uint64_t pa_2m_aligned = vault_gpa_base & ~0x1FFFFFULL;
+    pd[pd_i] = pa_2m_aligned | flags | (1ULL << 7); /* PS */
+}
+
+/* Start takeover on the current vCPU (target) */
+static int fx_step1_start_takeover(CPUState *cpu)
+{
+    struct kvm_regs  regs;
+    struct kvm_sregs sregs;
+    struct kvm_fpu   fpu;
+    void *vault_hva;
+
+    if (!fx_step1_armed) {
+        return 0;
+    }
+
+    /* Vault parameters must be set */
+    if (fx_step1_vault_gpa_base == 0 || fx_step1_vault_size < (FX_STEP1_PGT_OFF + FX_STEP1_PGT_BYTES + 0x1000)) {
+        fprintf(stderr, "[FX] Step1: invalid vault params (base=0x%llx size=0x%llx)\n",
+                (unsigned long long)fx_step1_vault_gpa_base,
+                (unsigned long long)fx_step1_vault_size);
+        fflush(stderr);
+        fx_step1_armed = 0;
+        return 0;
+    }
+
+    /* Resolve HVA for vault base so we can build page tables */
+    vault_hva = kvm_physical_memory_addr_to_host(kvm_state, (hwaddr)fx_step1_vault_gpa_base);
+    if (!vault_hva) {
+        fprintf(stderr, "[FX] Step1: vault_hva NULL for gpa=0x%llx\n",
+                (unsigned long long)fx_step1_vault_gpa_base);
+        fflush(stderr);
+        fx_step1_armed = 0;
+        return 0;
+    }
+
+    /* Stop-the-world (other vCPUs) */
+    fx_step1_pause_others(cpu);
+
+    /* Save full state */
+    memset(&regs, 0, sizeof(regs));
+    memset(&sregs, 0, sizeof(sregs));
+    memset(&fpu, 0, sizeof(fpu));
+    
+    kvm_vcpu_ioctl(cpu, KVM_GET_REGS,  &regs);
+    kvm_vcpu_ioctl(cpu, KVM_GET_SREGS, &sregs);
+
+    /* Save legacy FPU */
+    fx_step1_saved.have_fpu = 0;
+    memset(&fpu, 0, sizeof(fpu));
+    if (kvm_vcpu_ioctl(cpu, KVM_GET_FPU, &fpu) == 0) {
+        fx_step1_saved.fpu = fpu;
+        fx_step1_saved.have_fpu = 1;
+    }
+
+    /* Save XCRS if available */
+    fx_step1_saved.have_xcrs = 0;
+#ifdef KVM_GET_XCRS
+    if (fx_step1_cap_xcrs()) {
+        memset(&fx_step1_saved.xcrs, 0, sizeof(fx_step1_saved.xcrs));
+        if (kvm_vcpu_ioctl(cpu, KVM_GET_XCRS, &fx_step1_saved.xcrs) == 0) {
+            fx_step1_saved.have_xcrs = 1;
+        }
+    }
+#endif
+
+    /* Save XSAVE (older fixed-size API) if available */
+    fx_step1_saved.have_xsave = 0;
+#ifdef KVM_GET_XSAVE
+    if (fx_step1_cap_xsave()) {
+        memset(&fx_step1_saved.xsave, 0, sizeof(fx_step1_saved.xsave));
+        if (kvm_vcpu_ioctl(cpu, KVM_GET_XSAVE, &fx_step1_saved.xsave) == 0) {
+            fx_step1_saved.have_xsave = 1;
+        }
+    }
+#endif
+
+    fx_step1_saved.regs  = regs;
+    fx_step1_saved.sregs = sregs;
+    fx_step1_saved.valid = 1;
+
+
+
+    /* Build temporary page tables mapping EXEC_VA -> vault */
+    fx_step1_build_pagetables(vault_hva, fx_step1_vault_gpa_base);
+
+    /* Switch CR3 to our in-vault PML4 */
+    sregs.cr3 = fx_step1_vault_gpa_base + FX_STEP1_PGT_OFF;
+    kvm_vcpu_ioctl(cpu, KVM_SET_SREGS, &sregs);
+
+    /* Set RIP/RSP within the temporary mapping */
+    regs.rip = FX_STEP1_EXEC_VA + FX_STEP1_ENTRY_OFF;
+    regs.rsp = FX_STEP1_EXEC_VA + FX_STEP1_STACK_OFF + FX_STEP1_STACK_SIZE - 0x10;
+
+    /*
+     * Critical: disable interrupts while running with the temporary CR3
+     * that does NOT map the kernel. Otherwise a timer interrupt/exception
+     * will try to fetch kernel handlers and can lead to #DF.
+     *
+     * We restore original RFLAGS when we restore regs at the end.
+     */
+    regs.rflags &= ~X86_EFLAGS_IF;
+    regs.rflags |= 0x2ULL; /* bit 1 must be set */
+
+    kvm_vcpu_ioctl(cpu, KVM_SET_REGS, &regs);
+    fprintf(stderr, "[FX] Step1: entering vault with RFLAGS=0x%llx (IF=%d)\n",
+        (unsigned long long)regs.rflags,
+        (int)((regs.rflags & X86_EFLAGS_IF) != 0));
+    fflush(stderr);
+    fprintf(stderr, "[FX] Step1: takeover started on cpu=%p (RIP=0x%llx RSP=0x%llx CR3=0x%llx)\n",
+            (void *)cpu,
+            (unsigned long long)regs.rip,
+            (unsigned long long)regs.rsp,
+            (unsigned long long)sregs.cr3);
+    fflush(stderr);
+
+    /* Armed consumed: now we are running */
+    fx_step1_armed = 0;
+    return 1;
+}
+
+static void fx_step1_finish_takeover(CPUState *cpu)
+{
+    if (!fx_step1_saved.valid) {
+        return;
+    }
+
+    /* Restore order: SREGS -> REGS -> XCRS -> XSAVE -> FPU */
+    kvm_vcpu_ioctl(cpu, KVM_SET_SREGS, &fx_step1_saved.sregs);
+    kvm_vcpu_ioctl(cpu, KVM_SET_REGS,  &fx_step1_saved.regs);
+
+#ifdef KVM_SET_XCRS
+    if (fx_step1_saved.have_xcrs) {
+        (void)kvm_vcpu_ioctl(cpu, KVM_SET_XCRS, &fx_step1_saved.xcrs);
+    }
+#endif
+
+#ifdef KVM_SET_XSAVE
+    if (fx_step1_saved.have_xsave) {
+        (void)kvm_vcpu_ioctl(cpu, KVM_SET_XSAVE, &fx_step1_saved.xsave);
+    } else
+#endif
+    if (fx_step1_saved.have_fpu) {
+        (void)kvm_vcpu_ioctl(cpu, KVM_SET_FPU, &fx_step1_saved.fpu);
+    }
+
+    fx_step1_saved.valid = 0;
+
+    fx_step1_resume_others();
+
+    fx_step1_detach_req = 1;
+    fx_vault_step1_detach_from_kvmall();
+
+    fprintf(stderr, "[FX] Step1: takeover finished + restored, detach requested\n");
+    fflush(stderr);
+}
+
+
+
 
 static void do_protect_memory_hypercall(CPUState *cpu, struct kvm_regs *regs)
 {
@@ -3620,7 +3889,6 @@ static void execute_hypercall(CPUState *cpu)
 
         memcpy(&fx_bootstrap_info, guest_ptr, sizeof(fx_bootstrap_info));
         fx_bootstrap_valid = true;
-
         fprintf(stderr,
             "[FX] BOOTSTRAP_INFO received: init_task=0x%llx off_tasks=0x%x off_pid=0x%x off_comm=0x%x comm_len=%u task_struct_size=%u abi=%u\n",
             (unsigned long long)fx_bootstrap_info.init_task_addr,
@@ -3632,6 +3900,7 @@ static void execute_hypercall(CPUState *cpu)
             fx_bootstrap_info.abi
         );
         fflush(stderr);
+        fx_step1_arm_from_kvmall();
         break;
     }
     case SET_PROCESS_LIST_HYPERCALL:
@@ -3837,7 +4106,21 @@ int kvm_cpu_exec(CPUState *cpu)
 
     do {
         MemTxAttrs attrs;
+        /* FX Step1: stop-the-world parking point (non-target vCPUs) */
+        if (fx_step1_pause_on && cpu != fx_step1_target_cpu) {
+            fx_step1_init_sync_once();
 
+            qemu_mutex_lock(&fx_step1_pause_mtx);
+            fx_step1_paused_count++;
+            qemu_cond_broadcast(&fx_step1_pause_cv);
+
+            while (fx_step1_pause_on) {
+                qemu_cond_wait(&fx_step1_pause_cv, &fx_step1_pause_mtx);
+            }
+
+            fx_step1_paused_count--;
+            qemu_mutex_unlock(&fx_step1_pause_mtx);
+        }
         if (cpu->vcpu_dirty) {
             if (!kvm_cpu_synchronize_put(cpu, KVM_PUT_RUNTIME_STATE,
                                          "at runtime")) {
@@ -3860,6 +4143,17 @@ int kvm_cpu_exec(CPUState *cpu)
         if(start_monitor)
             check_idtr_gdtr(cpu);
 
+        /*
+         * FX Step1: if the vault is armed, start takeover on this vCPU.
+         * We choose a single target vCPU (CPU0) for Step1 simplicity.
+         */
+        if (fx_step1_armed) {
+            /* target policy: run on CPU0 only */
+            if (cpu->cpu_index == 0) {
+                fx_step1_start_takeover(cpu);
+            }
+        }
+        
         run_ret = kvm_vcpu_ioctl(cpu, KVM_RUN, 0);
 
         /*
@@ -3907,6 +4201,24 @@ int kvm_cpu_exec(CPUState *cpu)
         trace_kvm_run_exit(cpu->cpu_index, run->exit_reason);
         switch (run->exit_reason) {
         case KVM_EXIT_IO:
+            /*
+             * FX Step1: completion path:
+             * payload does OUT on FX_MAGIC_PORT_DONE -> we restore state.
+             */
+            if (run->io.direction == KVM_EXIT_IO_OUT &&
+                run->io.port == FX_MAGIC_PORT_DONE &&
+                fx_step1_saved.valid) {
+
+                fprintf(stderr, "[FX] Step1: KVM_EXIT_IO DONE port=0x%x size=%u count=%u\n",
+                        run->io.port, run->io.size, run->io.count);
+                fflush(stderr);
+
+                /* Do not forward I/O to normal devices */
+                fx_step1_finish_takeover(cpu);
+
+                ret = 0;
+                break;
+            }
             /* Called outside BQL */
             kvm_handle_io(run->io.port, attrs,
                           (uint8_t *)run + run->io.data_offset,

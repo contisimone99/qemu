@@ -17,7 +17,7 @@
 #include "hw/boards.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
-
+#include <stdbool.h>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -86,10 +86,28 @@ DECLARE_INSTANCE_CHECKER(FxState, FX,
 #define VAULT_MAX_PAYLOAD            2048
 #define VAULT_MAX_BLOB               (VAULT_HDR_SIZE + VAULT_MAX_PAYLOAD)
 
-
+#define FX_MAGIC_PORT_DONE           0x00F1
+#define FX_STEP1_ENTRY_OFF           0x0000ULL
+#define FX_STEP1_STACK_OFF           0x4000ULL
+#define FX_STEP1_STACK_SIZE          0x1000ULL
+#define FX_STEP1_PGT_OFF             0x8000ULL
+#define FX_STEP1_PGT_BYTES           0x3000ULL
 
 #define CONF_INTERVAL_DEFAULT       10
 #define CONF_SERVER_PORT            3333
+/* ===== FX Step1 interface to kvm-all ===== */
+extern bool fx_bootstrap_valid;                 /* set by BOOTSTRAP_INFO hypercall handler */
+extern uint64_t fx_step1_vault_gpa_base;
+extern uint64_t fx_step1_vault_size;
+extern volatile int fx_step1_armed;
+extern volatile int fx_step1_detach_req;
+
+
+/* Set to true after BOOTSTRAP_INFO is received/validated by KVM side */
+bool fx_bootstrap_valid = false;
+/* Must match runall.sh memaddr for virtio-mem */
+#define FX_VAULT_GPA_BASE_DEFAULT    0x100000000ULL
+
 
 struct FxState {
     PCIDevice pdev;
@@ -151,6 +169,89 @@ static uint64_t fx_round_up_u64(uint64_t, uint64_t);
 static void fx_vault_step5_resolve(FxState *);
 static void fx_vault_step5_ensure_resolved(FxState *);
 static void fx_vault_step5_set_ept_ro(FxState *, bool);
+
+/* ===== FX Step1 prototypes / forward decls ===== */
+
+/* singleton device instance (set in realize) */
+static FxState *fx_global_singleton;
+
+/* Step5 helpers used by Step1 arm/detach (they already exist later as static funcs) */
+
+/* Step1 exports called from kvm-all.c */
+void fx_step1_arm_from_kvmall(void);
+void fx_vault_step1_detach_from_kvmall(void);
+
+static void fx_step1_write_payload(FxState *fx)
+{
+    /*
+     * 16-bit compatible payload (also valid in 64-bit mode):
+     *   mov dx, imm16
+     *   mov al, 0x01
+     *   out dx, al
+     *   hlt
+     */
+    static const uint8_t payload[] = {
+        0xBA, (uint8_t)(FX_MAGIC_PORT_DONE & 0xFF), (uint8_t)((FX_MAGIC_PORT_DONE >> 8) & 0xFF), /* mov dx, imm16 */
+        0xB0, 0x01,             /* mov al, 1 */
+        0xEE,                   /* out dx, al */
+        0xF4                    /* hlt */
+    };
+
+    if (!fx->vault_ram_ptr || fx->vault_ram_size < 0x10000) {
+        fprintf(stderr, "fx: step1 payload: vault_ram_ptr NULL or too small\n");
+        return;
+    }
+
+    /* code at 0x0000 */
+    memcpy((uint8_t *)fx->vault_ram_ptr + FX_STEP1_ENTRY_OFF, payload, sizeof(payload));
+
+    /* stack area: zero it */
+    memset((uint8_t *)fx->vault_ram_ptr + FX_STEP1_STACK_OFF, 0, FX_STEP1_STACK_SIZE);
+
+    /* page tables area: zero (kvm-all will build them too, but keep clean) */
+    memset((uint8_t *)fx->vault_ram_ptr + FX_STEP1_PGT_OFF, 0, FX_STEP1_PGT_BYTES);
+
+    fprintf(stderr, "fx: step1 payload written (len=%zu)\n", sizeof(payload));
+}
+
+static void fx_step1_arm_if_ready(FxState *fx)
+{
+    if (!fx_bootstrap_valid) {
+        fprintf(stderr, "fx: step1 arm blocked: bootstrap not valid yet\n");
+        return;
+    }
+
+    fx_vault_step5_ensure_resolved(fx);
+
+    if (!fx->vault_ram_ptr || !fx->vault_vmem_dev) {
+        fprintf(stderr, "fx: step1 arm failed: virtio-mem/memdev not resolved\n");
+        return;
+    }
+
+    /*
+     * Attach vault memory (requested-size > 0)
+     * Use one block for Step1.
+     */
+    fx_vault_set_requested_size(fx, VAULT_VMEM_BLOCK_SIZE);
+
+    /* Write minimal payload into vault RAM backend */
+    fx_step1_write_payload(fx);
+
+    /* Publish vault params to kvm-all takeover engine */
+    fx_step1_vault_gpa_base = FX_VAULT_GPA_BASE_DEFAULT;
+    fx_step1_vault_size     = VAULT_VMEM_BLOCK_SIZE;
+    fx_step1_armed          = 1;
+
+    fprintf(stderr, "fx: step1 armed (gpa=0x%llx size=0x%llx)\n",
+            (unsigned long long)fx_step1_vault_gpa_base,
+            (unsigned long long)fx_step1_vault_size);
+}
+
+
+
+
+
+
 
 static inline void vault_put_le32(uint8_t *p, uint32_t v)
 {
@@ -732,6 +833,9 @@ static void fx_vault_step5_ensure_resolved(FxState *fx)
 static void pci_fx_realize(PCIDevice *pdev, Error **errp)
 {
     FxState *fx = FX(pdev);
+
+    fx_global_singleton = fx;
+
     uint8_t *pci_conf = pdev->config;
 
     pci_config_set_interrupt_pin(pci_conf, 1);
@@ -822,4 +926,43 @@ static void pci_fx_register_types(void)
 
     type_register_static(&fx_info);
 }
+
+void fx_step1_arm_from_kvmall(void)
+{
+    if (!fx_global_singleton) {
+        fprintf(stderr, "fx: step1 arm: no fx instance\n");
+        return;
+    }
+    fx_step1_arm_if_ready(fx_global_singleton);
+}
+
+void fx_vault_step1_detach_from_kvmall(void)
+{
+    /*
+     * Called by kvm-all after DONE.
+     * We detach and invalidate the vault region.
+     *
+     * Important: fail-closed. If something is inconsistent, still try to detach.
+     */
+    FxState *fx = NULL;
+
+    /* If you already have a global pointer to the device instance, use it.
+     * Otherwise, store it during realize (recommended).
+     */
+
+
+    fx = fx_global_singleton;
+    if (!fx) {
+        fprintf(stderr, "fx: step1 detach: no fx instance available\n");
+        return;
+    }
+
+    /* detach requested-size=0 */
+    fx_vault_step5_detach_and_invalidate(fx);
+
+    fprintf(stderr, "fx: step1 detach completed\n");
+}
+
+
+
 type_init(pci_fx_register_types)
