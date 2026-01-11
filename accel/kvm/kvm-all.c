@@ -4000,7 +4000,6 @@ static void execute_hypercall(CPUState *cpu)
             fx_bootstrap_info.abi
         );
         fflush(stderr);
-        fx_step1_arm_from_kvmall();
         break;
     }
     case SET_PROCESS_LIST_HYPERCALL:
@@ -4309,9 +4308,9 @@ int kvm_cpu_exec(CPUState *cpu)
             if (run->io.direction == KVM_EXIT_IO_OUT &&
                 run->io.port == FX_MAGIC_PORT_DONE &&
                 fx_step1_saved.valid) {
-
-                fprintf(stderr, "[FX] Step1: KVM_EXIT_IO DONE port=0x%x size=%u count=%u\n",
-                        run->io.port, run->io.size, run->io.count);
+                uint8_t v = run->io.data_offset ? *(uint8_t *)((uint8_t *)run + run->io.data_offset) : 0;
+                fprintf(stderr, "[FX] Step1: KVM_EXIT_IO DONE port=0x%x size=%u count=%u val=0x%x\n",
+                        run->io.port, run->io.size, run->io.count, v);
                 fflush(stderr);
 
                 /* Do not forward I/O to normal devices */

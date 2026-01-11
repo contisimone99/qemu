@@ -238,7 +238,7 @@ static void fx_step1_write_payload(FxState *fx)
      *   hlt
      */
     static const uint8_t payload[] = {
-        0xBA, (uint8_t)(FX_MAGIC_PORT_DONE & 0xFF), (uint8_t)((FX_MAGIC_PORT_DONE >> 8) & 0xFF), /* mov dx, imm16 */
+        0x66, 0xBA, (uint8_t)(FX_MAGIC_PORT_DONE & 0xFF), (uint8_t)((FX_MAGIC_PORT_DONE >> 8) & 0xFF), /* mov dx, imm16 */
         0xB0, 0x01,             /* mov al, 1 */
         0xEE,                   /* out dx, al */
         0xF4                    /* hlt */
