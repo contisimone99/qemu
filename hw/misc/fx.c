@@ -93,6 +93,16 @@ DECLARE_INSTANCE_CHECKER(FxState, FX,
 #define FX_STEP1_PGT_OFF             0x8000ULL
 #define FX_STEP1_PGT_BYTES           0x3000ULL
 
+/* ===== Step1 periodic loop (attach/run/detach repeatedly) ===== */
+#define FX_STEP1_PERIOD_MS_DEFAULT      3000   /* 3s between windows */
+#define FX_STEP1_ARM_SETTLE_MS          300    /* wait after attach before expecting takeover */
+#define FX_STEP1_WINDOW_TIMEOUT_MS      2000  /* fail-closed if stuck */
+#define FX_STEP1_DETACH_COOLDOWN_MS  800
+#define FX_STEP1_DETACH_POLL_MS        50     /* poll plugged size */
+#define FX_STEP1_UNPLUG_TIMEOUT_MS     5000   /* max wait for size->0 */
+#define FX_STEP1_PLUG_POLL_MS        20
+#define FX_STEP1_PLUG_TIMEOUT_MS     5000
+
 #define CONF_INTERVAL_DEFAULT       10
 #define CONF_SERVER_PORT            3333
 /* ===== FX Step1 interface to kvm-all ===== */
@@ -138,7 +148,15 @@ struct FxState {
     uint64_t vault_ram_size;
     MemoryRegion *vault_mr;       /* MemoryRegion of /objects/vaultmem */
     DeviceState *vault_vmem_dev;  /* virtio-mem-pci device (id=vault0) */
-
+    /* Step1 periodic runner */
+    QEMUTimer *step1_timer;
+    uint32_t   step1_period_ms;
+    int64_t    step1_deadline_ns;   /* when current window must complete */
+    bool       step1_inflight;      /* true after we armed, until detach */
+    bool       step1_wait_unplug;
+    int64_t    step1_unplug_deadline_ns;
+    bool      step1_wait_plug;
+    int64_t   step1_plug_deadline_ns;
 
     QemuMutex conf_mutex;
     unsigned int conf_sleep_interval;
@@ -169,6 +187,10 @@ static uint64_t fx_round_up_u64(uint64_t, uint64_t);
 static void fx_vault_step5_resolve(FxState *);
 static void fx_vault_step5_ensure_resolved(FxState *);
 static void fx_vault_step5_set_ept_ro(FxState *, bool);
+static void fx_step1_periodic_init(FxState *fx);
+static void fx_step1_periodic_uninit(FxState *fx);
+static void fx_step1_timer_cb(void *opaque);
+static void fx_step1_force_detach_reset(FxState *fx, const char *why);
 
 /* ===== FX Step1 prototypes / forward decls ===== */
 
@@ -176,6 +198,31 @@ static void fx_vault_step5_set_ept_ro(FxState *, bool);
 static FxState *fx_global_singleton;
 
 /* Step5 helpers used by Step1 arm/detach (they already exist later as static funcs) */
+
+
+static uint64_t fx_vmem_get_plugged_size(FxState *fx)
+{
+    Error *local_err = NULL;
+    uint64_t sz = 0;
+
+    if (!fx->vault_vmem_dev) {
+        return 0;
+    }
+
+    /* Virtio-mem exposes "size" as current plugged size */
+    sz = object_property_get_uint(OBJECT(fx->vault_vmem_dev), "size", &local_err);
+    if (local_err) {
+        fprintf(stderr, "fx: virtio-mem: cannot read property 'size': %s\n",
+                error_get_pretty(local_err));
+        error_free(local_err);
+        return 0;
+    }
+
+    return sz;
+}
+
+
+
 
 /* Step1 exports called from kvm-all.c */
 void fx_step1_arm_from_kvmall(void);
@@ -237,14 +284,16 @@ static void fx_step1_arm_if_ready(FxState *fx)
     /* Write minimal payload into vault RAM backend */
     fx_step1_write_payload(fx);
 
-    /* Publish vault params to kvm-all takeover engine */
-    fx_step1_vault_gpa_base = FX_VAULT_GPA_BASE_DEFAULT;
-    fx_step1_vault_size     = VAULT_VMEM_BLOCK_SIZE;
-    fx_step1_armed          = 1;
+    /* We requested the plug, now wait for guest to complete hotplug */
+    fx->step1_wait_plug = true;
+    fx->step1_plug_deadline_ns =
+        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + (int64_t)FX_STEP1_PLUG_TIMEOUT_MS * 1000000LL;
 
-    fprintf(stderr, "fx: step1 armed (gpa=0x%llx size=0x%llx)\n",
-            (unsigned long long)fx_step1_vault_gpa_base,
-            (unsigned long long)fx_step1_vault_size);
+    /* DO NOT publish to takeover engine yet */
+    fx_step1_armed = 0;
+
+    fprintf(stderr, "fx: step1 requested plug (waiting for completion)\n");
+
 }
 
 
@@ -829,6 +878,224 @@ static void fx_vault_step5_ensure_resolved(FxState *fx)
     fx_vault_step5_resolve(fx);
 }
 
+static inline int64_t fx_now_ns(void)
+{
+    return qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+}
+
+static void fx_step1_force_detach_reset(FxState *fx, const char *why)
+{
+    fprintf(stderr, "fx: step1: FORCE detach/reset (%s)\n", why ? why : "unknown");
+
+    /* fail-closed: always try to detach + invalidate */
+    fx_vault_step5_detach_and_invalidate(fx);
+
+    /* clear global step1 flags used by kvm-all */
+    fx_step1_armed = 0;
+    fx_step1_detach_req = 0;
+
+    fx->step1_inflight = false;
+    fx->step1_deadline_ns = 0;
+}
+
+static void fx_step1_timer_cb(void *opaque)
+{
+    FxState *fx = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    /* Default period (ms) between attempts when fully idle */
+    uint32_t period_ms = fx->step1_period_ms ? fx->step1_period_ms : FX_STEP1_PERIOD_MS_DEFAULT;
+
+    /* ---- Gate on bootstrap ---- */
+    if (!fx_bootstrap_valid) {
+        timer_mod(fx->step1_timer, now + (int64_t)period_ms * 1000000LL);
+        return;
+    }
+
+    /*
+     * IMPORTANT STATE RULES:
+     * - While waiting for plug completion -> NEVER arm again.
+     * - While armed/inflight -> NEVER arm again; only wait detach_req or timeout.
+     * - While waiting for unplug completion -> NEVER arm again.
+     */
+
+    /* ---- WAIT_PLUG: requested-size was set; wait until virtio-mem "size" reaches block ---- */
+    if (fx->step1_wait_plug) {
+        uint64_t plugged = fx_vmem_get_plugged_size(fx);
+
+        if (plugged == VAULT_VMEM_BLOCK_SIZE) {
+            fprintf(stderr,
+                    "fx: step1: plug complete (virtio-mem size=0x%llx), publishing armed\n",
+                    (unsigned long long)plugged);
+
+            fx->step1_wait_plug = false;
+            fx->step1_plug_deadline_ns = 0;
+
+            /*
+             * Publish vault parameters for kvm-all BEFORE setting armed=1.
+             * These must match what kvm-all reads.
+             */
+            fx_step1_vault_gpa_base = FX_VAULT_GPA_BASE_DEFAULT;
+            fx_step1_vault_size     = VAULT_VMEM_BLOCK_SIZE;
+
+            /* Make Step1 visible to takeover engine */
+            fx_step1_armed = 1;
+
+            /* From now on we consider the window "inflight" (pending consumption) */
+            fx->step1_inflight = true;
+            fx->step1_deadline_ns =
+                now + (int64_t)FX_STEP1_WINDOW_TIMEOUT_MS * 1000000LL;
+
+            /* Tick soon to observe detach_req quickly */
+            timer_mod(fx->step1_timer, now + 20LL * 1000000LL);
+            return;
+        }
+
+        if (fx->step1_plug_deadline_ns && now > fx->step1_plug_deadline_ns) {
+            fprintf(stderr,
+                    "fx: step1: plug timeout (virtio-mem size=0x%llx) -> detach+invalidate\n",
+                    (unsigned long long)plugged);
+
+            fx->step1_wait_plug = false;
+            fx->step1_plug_deadline_ns = 0;
+
+            /* Fail-closed cleanup */
+            fx_vault_step5_detach_and_invalidate(fx);
+            fx_step1_armed = 0;
+            fx_step1_detach_req = 0;
+            fx->step1_inflight = false;
+            fx->step1_deadline_ns = 0;
+
+            /* Backoff */
+            timer_mod(fx->step1_timer, now + 1000LL * 1000000LL);
+            return;
+        }
+
+        /* Still plugging: poll soon */
+        timer_mod(fx->step1_timer, now + (int64_t)FX_STEP1_PLUG_POLL_MS * 1000000LL);
+        return;
+    }
+
+    /* ---- WAIT_UNPLUG: after detach, wait until virtio-mem size drops to 0 ---- */
+    if (fx->step1_wait_unplug) {
+        uint64_t plugged = fx_vmem_get_plugged_size(fx);
+
+        if (plugged == 0) {
+            fprintf(stderr, "fx: step1: unplug complete (virtio-mem size=0)\n");
+            fx->step1_wait_unplug = false;
+            fx->step1_unplug_deadline_ns = 0;
+
+            /* Now fully idle: wait normal period before arming again */
+            timer_mod(fx->step1_timer, now + (int64_t)period_ms * 1000000LL);
+            return;
+        }
+
+        if (fx->step1_unplug_deadline_ns && now > fx->step1_unplug_deadline_ns) {
+            fprintf(stderr,
+                    "fx: step1: unplug timeout (virtio-mem size=0x%llx) -> force reset\n",
+                    (unsigned long long)plugged);
+
+            fx_step1_force_detach_reset(fx, "unplug timeout");
+            fx->step1_wait_unplug = false;
+            fx->step1_unplug_deadline_ns = 0;
+
+            timer_mod(fx->step1_timer, now + 1000LL * 1000000LL);
+            return;
+        }
+
+        timer_mod(fx->step1_timer, now + (int64_t)FX_STEP1_DETACH_POLL_MS * 1000000LL);
+        return;
+    }
+
+    /*
+     * ---- ARMED/INFLIGHT: do not arm again.
+     * Wait for detach request from takeover engine or for a safety timeout.
+     *
+     * NOTE: fx_step1_armed might remain 1 until kvm-all finishes and sets detach_req,
+     * depending on your design. We treat either "inflight" or "armed" as "busy".
+     */
+    if (fx->step1_inflight || fx_step1_armed) {
+        if (fx_step1_detach_req) {
+            fprintf(stderr, "fx: step1: detach_req observed -> detach+invalidate\n");
+
+            fx_vault_step5_detach_and_invalidate(fx);
+
+            fx_step1_detach_req = 0;
+            fx_step1_armed = 0;
+
+            fx->step1_inflight = false;
+            fx->step1_deadline_ns = 0;
+
+            /* Enter WAIT_UNPLUG barrier */
+            fx->step1_wait_unplug = true;
+            fx->step1_unplug_deadline_ns =
+                now + (int64_t)FX_STEP1_UNPLUG_TIMEOUT_MS * 1000000LL;
+
+            timer_mod(fx->step1_timer, now + (int64_t)FX_STEP1_DETACH_POLL_MS * 1000000LL);
+            return;
+        }
+
+        if (fx->step1_deadline_ns && now > fx->step1_deadline_ns) {
+            fx_step1_force_detach_reset(fx, "window timeout");
+            timer_mod(fx->step1_timer, now + 1000LL * 1000000LL);
+            return;
+        }
+
+        /* Still waiting; poll */
+        timer_mod(fx->step1_timer, now + 50LL * 1000000LL);
+        return;
+    }
+
+    /* ---- IDLE: arm a new window ---- */
+    fprintf(stderr, "fx: step1: arming periodic window\n");
+
+    /*
+     * fx_step1_arm_if_ready() MUST:
+     * - set requested-size to VAULT_VMEM_BLOCK_SIZE (attach)
+     * - write payload/PT/stack as needed
+     * - set: fx->step1_wait_plug = true
+     * - set: fx->step1_plug_deadline_ns = now + FX_STEP1_PLUG_TIMEOUT_MS
+     * - MUST NOT set fx_step1_armed=1 here
+     */
+    fx_step1_arm_if_ready(fx);
+
+    /* If it didn't enter WAIT_PLUG, just retry later */
+    if (!fx->step1_wait_plug) {
+        timer_mod(fx->step1_timer, now + (int64_t)period_ms * 1000000LL);
+        return;
+    }
+
+    /* Enter plug polling quickly */
+    timer_mod(fx->step1_timer, now + (int64_t)FX_STEP1_PLUG_POLL_MS * 1000000LL);
+}
+
+
+static void fx_step1_periodic_init(FxState *fx)
+{
+    fx->step1_period_ms = FX_STEP1_PERIOD_MS_DEFAULT;
+    fx->step1_inflight = false;
+    fx->step1_deadline_ns = 0;
+
+    fx->step1_timer = timer_new_ns(QEMU_CLOCK_REALTIME, fx_step1_timer_cb, fx);
+    timer_mod(fx->step1_timer, fx_now_ns() + (int64_t)fx->step1_period_ms * 1000000LL);
+
+    fprintf(stderr, "fx: step1 periodic runner enabled (period=%u ms)\n", fx->step1_period_ms);
+}
+
+static void fx_step1_periodic_uninit(FxState *fx)
+{
+    if (!fx->step1_timer) {
+        return;
+    }
+
+    timer_del(fx->step1_timer);
+    timer_free(fx->step1_timer);
+    fx->step1_timer = NULL;
+
+    /* fail-closed cleanup */
+    fx_step1_force_detach_reset(fx, "device uninit");
+}
+
 
 static void pci_fx_realize(PCIDevice *pdev, Error **errp)
 {
@@ -854,8 +1121,10 @@ static void pci_fx_realize(PCIDevice *pdev, Error **errp)
     pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &fx->mmio);
 
     conf_server_init((void *)fx);
-    /* Step 5: resolve virtio-mem + memdev backend once */
+    /* resolve virtio-mem + memdev backend once */
     fx_vault_step5_resolve(fx);
+    /* Step1 periodic attach/run/detach loop */
+    fx_step1_periodic_init(fx);
 
 }
 
@@ -874,6 +1143,8 @@ static void pci_fx_uninit(PCIDevice *pdev)
 
     conf_server_uninit((void *)fx);
 
+    /* Stop Step1 periodic runner + fail-closed detach */
+    fx_step1_periodic_uninit(fx);
     msi_uninit(pdev);
 }
 
@@ -891,6 +1162,14 @@ static void fx_instance_init(Object *obj)
     fx->vault_data_off = 0;
     fx->vault_blob_len = 0;
     fx->vault_mr = NULL;
+    fx->step1_timer = NULL;
+    fx->step1_period_ms = FX_STEP1_PERIOD_MS_DEFAULT;
+    fx->step1_deadline_ns = 0;
+    fx->step1_inflight = false;
+    fx->step1_wait_unplug = false;
+    fx->step1_unplug_deadline_ns = 0;
+    fx->step1_wait_plug = false;
+    fx->step1_plug_deadline_ns = 0;
 
     memset(fx->vault_blob, 0, sizeof(fx->vault_blob));
 }
