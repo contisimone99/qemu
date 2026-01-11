@@ -37,54 +37,10 @@ DECLARE_INSTANCE_CHECKER(FxState, FX,
 #define INTERRUPT_ACK_REGISTER      0x64
 
 
-#define VAULT_CMD_REGISTER           0xA0
-#define VAULT_STATUS_REGISTER        0xA4
-#define VAULT_LAST_OPID_REGISTER     0xA8
-#define VAULT_SIZE_REGISTER          0xAC  /* write: payload size required */
-#define VAULT_DATA_RESET_REGISTER    0xB0  /* write: reset read cursor */
-#define VAULT_DATA_REGISTER          0xB4  /* read: stream u32 header+payload */
-#define VAULT_DLEN_REGISTER          0xB8  /* read: total available length (header+payload) */
-#define VAULT_ERR_REGISTER           0xBC  /* read-only: last error code */
-
-/* status bitfield */
-#define VAULT_STATUS_STATE_MASK      0x3
-#define VAULT_STATUS_STATE_IDLE      0x0
-#define VAULT_STATUS_STATE_READY     0x1
-#define VAULT_STATUS_STATE_ERROR     0x2
-#define VAULT_STATUS_BLOB_PRESENT    (1u << 2)
-#define VAULT_STATUS_BUSY            (1u << 3)
-
 /* Step 5 (virtio-mem) */
 #define VAULT_VMEM_ID_DEFAULT        "vault0"
 #define VAULT_MEMDEV_ID_DEFAULT      "vaultmem"
 #define VAULT_VMEM_BLOCK_SIZE        (128 * 1024 * 1024ULL) /* must match runall.sh block-size */
-
-
-/* error codes */
-#define VAULT_ERR_NONE               0
-#define VAULT_ERR_BAD_STATE          1
-#define VAULT_ERR_BAD_PARAMS         2
-#define VAULT_ERR_DONE_EARLY         3
-#define VAULT_ERR_UNKNOWN_CMD        4
-
-
-
-
-#define VAULT_CMD_PREPARE            0x1
-#define VAULT_CMD_DONE               0x2
-#define VAULT_CMD_FAIL               0x3   /* Step 2: guest signals validation fail */
-#define VAULT_CMD_RESET              0x4   /* Step 3.x: recovery to IDLE */
-
-
-
-#define VAULT_ST_IDLE                0x0
-#define VAULT_ST_READY               0x1
-#define VAULT_ST_ERROR               0xFF
-
-#define VAULT_MAGIC                  0x30544C56u /* 'V' 'L' 'T' '0' */
-#define VAULT_HDR_SIZE               16
-#define VAULT_MAX_PAYLOAD            2048
-#define VAULT_MAX_BLOB               (VAULT_HDR_SIZE + VAULT_MAX_PAYLOAD)
 
 #define FX_MAGIC_PORT_DONE           0x00F1
 #define FX_STEP1_ENTRY_OFF           0x0000ULL
@@ -131,17 +87,6 @@ struct FxState {
 
     uint32_t irq_status;
     uint32_t card_liveness;
-    uint32_t vault_state;
-    uint32_t vault_err;
-    uint32_t vault_cmd;
-    uint32_t vault_opid;
-    uint32_t vault_last_opid;
-    uint32_t vault_next_opid;
-    uint32_t vault_size;
-    uint32_t vault_data_off;      /* Step1-4 cursor: no longer used in Step5 */
-    uint32_t vault_blob_len;
-    uint32_t vault_consumed_len;  /* Step5: guest writes consumed blob_len here */
-    uint8_t  vault_blob[VAULT_MAX_BLOB];
 
     /* Step5: virtio-mem plumbing */
     void     *vault_ram_ptr;      /* host ptr to memory-backend-ram */
@@ -180,10 +125,8 @@ static void conf_server_init(void *);
 static void conf_server_uninit(void *);
 static void accept_conf_server_callback(void *);
 static void read_conf_server_callback(void *);
-static bool fx_vault_step5_ready(FxState *);
 static void fx_vault_set_requested_size(FxState *, uint64_t);
 static void fx_vault_step5_detach_and_invalidate(FxState *);
-static uint64_t fx_round_up_u64(uint64_t, uint64_t);
 static void fx_vault_step5_resolve(FxState *);
 static void fx_vault_step5_ensure_resolved(FxState *);
 static void fx_vault_step5_set_ept_ro(FxState *, bool);
@@ -296,30 +239,6 @@ static void fx_step1_arm_if_ready(FxState *fx)
 
 }
 
-
-
-
-
-
-
-static inline void vault_put_le32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)(v & 0xFF);
-    p[1] = (uint8_t)((v >> 8) & 0xFF);
-    p[2] = (uint8_t)((v >> 16) & 0xFF);
-    p[3] = (uint8_t)((v >> 24) & 0xFF);
-}
-
-static inline uint32_t fx_vault_status_word(FxState *fx)
-{
-    uint32_t st = (fx->vault_state & VAULT_STATUS_STATE_MASK);
-    if (fx->vault_blob_len != 0) {
-        st |= VAULT_STATUS_BLOB_PRESENT;
-    }
-    /* busy per ora sempre 0 */
-    return st;
-}
-
 static const MemoryRegionOps fx_mmio_ops = {
     .read = fx_mmio_read,
     .write = fx_mmio_write,
@@ -380,18 +299,6 @@ static uint64_t fx_mmio_read(void *opaque, hwaddr addr, unsigned size)
         case INTERRUPT_STATUS_REGISTER:
             val = fx->irq_status;
             break;
-        case VAULT_STATUS_REGISTER:
-            val = fx_vault_status_word(fx);
-            break;
-        case VAULT_ERR_REGISTER:
-            val = fx->vault_err;
-            break;
-        case VAULT_LAST_OPID_REGISTER:
-            val = fx->vault_last_opid;
-            break;
-        case VAULT_DLEN_REGISTER:
-            val = fx->vault_blob_len;
-            break;
         default:
             break;
         }
@@ -423,159 +330,6 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case INTERRUPT_ACK_REGISTER:
         fx_lower_irq(fx, val);
-        break;
-
-
-    case VAULT_CMD_REGISTER:
-        fx->vault_cmd = (uint32_t)val;
-
-        if (fx->vault_cmd == VAULT_CMD_PREPARE) {
-
-            /* Enforce state machine: PREPARE only from IDLE */
-            if (fx->vault_state != VAULT_STATUS_STATE_IDLE) {
-                    fx->vault_state = VAULT_STATUS_STATE_ERROR;
-                    fx->vault_err = VAULT_ERR_BAD_STATE;
-                    fprintf(stderr,
-                            "fx_mmio_write: VAULT_CMD_PREPARE rejected (not IDLE). status=%u\n",
-                            fx->vault_state);
-                    break;
-            }
-    
-
-            if (fx->vault_size == 0 || fx->vault_size > VAULT_MAX_PAYLOAD) {
-                    fx->vault_state = VAULT_STATUS_STATE_ERROR;
-                    fx->vault_err = VAULT_ERR_BAD_PARAMS;
-                    fprintf(stderr,
-                            "fx_mmio_write: VAULT_CMD_PREPARE invalid params opid=%u size=%u\n",
-                            fx->vault_opid, fx->vault_size);
-                    break;
-            }
-
-            /* build blob: [header|payload] */
-            fx->vault_data_off = 0;
-            fx->vault_blob_len = VAULT_HDR_SIZE + fx->vault_size;
-            fx->vault_opid = ++fx->vault_next_opid;
-            vault_put_le32(&fx->vault_blob[0],  VAULT_MAGIC);
-            vault_put_le32(&fx->vault_blob[4],  fx->vault_opid);
-            vault_put_le32(&fx->vault_blob[8],  fx->vault_size);
-            vault_put_le32(&fx->vault_blob[12], 0);
-
-            for (uint32_t i = 0; i < fx->vault_size; i++) {
-                fx->vault_blob[VAULT_HDR_SIZE + i] = (uint8_t)(i & 0xFF);
-            }
-            fx_vault_step5_ensure_resolved(fx);
-
-            /* Step 5: write blob into vaultmem and hotplug via virtio-mem requested-size */
-            if (!fx_vault_step5_ready(fx)) {
-                fx->vault_state = VAULT_STATUS_STATE_ERROR;
-                fx->vault_err = VAULT_ERR_BAD_STATE;
-                fprintf(stderr, "fx_mmio_write: PREPARE failed (step5 not ready: memdev/virtio-mem unresolved)\n");
-                break;
-            }
-
-            if (fx->vault_blob_len > fx->vault_ram_size) {
-                fx->vault_state = VAULT_STATUS_STATE_ERROR;
-                fx->vault_err = VAULT_ERR_BAD_PARAMS;
-                fprintf(stderr, "fx_mmio_write: PREPARE failed (blob_len=%u > vault_ram_size=%" PRIu64 ")\n",
-                        fx->vault_blob_len, fx->vault_ram_size);
-                break;
-            }
-
-            /* copy into backend RAM (offset 0) */
-            memcpy(fx->vault_ram_ptr, fx->vault_blob, fx->vault_blob_len);
-            /*
-             * Step 5 hardening: set EPT RO before hotplugging via virtio-mem.
-             * This ensures memslots are created as READONLY (EPT RO) from the start.
-             */
-            fx_vault_step5_set_ept_ro(fx, true);
-
-            /* attach only what is needed (rounded to virtio-mem block size) */
-            uint64_t req = fx_round_up_u64((uint64_t)fx->vault_blob_len, VAULT_VMEM_BLOCK_SIZE);
-            fx_vault_set_requested_size(fx, req);
-
-            /* reset consumed_len enforcement */
-            fx->vault_consumed_len = 0;
-
-
-
-            fx->vault_last_opid = fx->vault_opid;
-            fx->vault_state = VAULT_STATUS_STATE_READY;
-            fx->vault_err = VAULT_ERR_NONE;
-            fprintf(stderr,
-                    "fx_mmio_write: VAULT_CMD_PREPARE accepted opid=%u size=%u blob_len=%u\n",
-                    fx->vault_opid, fx->vault_size, fx->vault_blob_len);
-
-        } else if (fx->vault_cmd == VAULT_CMD_DONE) {
-
-            fprintf(stderr,
-                    "fx_mmio_write: VAULT_CMD_DONE received opid=%u (consumed=%u blob_len=%u vault_state=%u)\n",
-                    fx->vault_opid, fx->vault_consumed_len, fx->vault_blob_len, fx->vault_state);
-
-            /*
-            * Step 3.2: accept DONE only if the guest fully consumed the blob.
-            * Fail-closed on early DONE.
-            */
-            if (fx->vault_state != VAULT_STATUS_STATE_READY || fx->vault_consumed_len != fx->vault_blob_len) {
-                fprintf(stderr,
-                        "fx_mmio_write: DONE rejected (not fully consumed). consumed=%u blob_len=%u -> ERROR + invalidate\n",
-                        fx->vault_consumed_len, fx->vault_blob_len);
-
-                fx->vault_state = VAULT_STATUS_STATE_ERROR;
-                fx->vault_err = VAULT_ERR_BAD_STATE;
-
-                /* detach + invalidate */
-                fx_vault_step5_detach_and_invalidate(fx);
-                break;
-            }
-
-            /* OK path: detach + invalidate and return to IDLE */
-            fx->vault_state = VAULT_STATUS_STATE_IDLE;
-            fx->vault_err = VAULT_ERR_NONE;
-            fx_vault_step5_detach_and_invalidate(fx);
-        } else if (fx->vault_cmd == VAULT_CMD_FAIL) {
-
-            fprintf(stderr,
-                    "fx_mmio_write: VAULT_CMD_FAIL received opid=%u. Mark ERROR + invalidate.\n",
-                    fx->vault_opid);
-
-            /* fail-closed: mark error + detach + invalidate */
-            fx->vault_state = VAULT_STATUS_STATE_ERROR;
-            fx->vault_err = VAULT_ERR_BAD_PARAMS;
-
-            fx_vault_step5_detach_and_invalidate(fx);
-        } else if (fx->vault_cmd == VAULT_CMD_RESET) {
-
-            fprintf(stderr,
-                    "fx_mmio_write: VAULT_CMD_RESET received. Force IDLE + detach + invalidate.\n");
-
-            fx->vault_state = VAULT_STATUS_STATE_IDLE;
-            fx->vault_err = VAULT_ERR_NONE;
-
-            fx_vault_step5_detach_and_invalidate(fx);
-            }
-        else {
-            
-            fx->vault_state = VAULT_STATUS_STATE_ERROR;
-            fx->vault_err = VAULT_ERR_UNKNOWN_CMD;
-            fprintf(stderr,
-                    "fx_mmio_write: VAULT_CMD unknown=%u -> ERROR\n",
-                    fx->vault_cmd);
-        }
-        break;
-
-    case VAULT_SIZE_REGISTER:
-        fx->vault_size = (uint32_t)val;
-        break;
-    
-    case VAULT_DATA_REGISTER:
-        /* Step 5: guest writes how many bytes were consumed (enforcement for DONE) */
-        fx->vault_consumed_len = (uint32_t)val;
-        break;
-
-    case VAULT_DATA_RESET_REGISTER:
-        if (fx->vault_state == VAULT_STATUS_STATE_READY) {
-            fx->vault_data_off = 0;
-        }
         break;      
     default:
         break;
@@ -710,12 +464,6 @@ static void read_conf_server_callback(void *opaque)
     close(fx->conn_fd);
 }
 
-static bool fx_vault_step5_ready(FxState *fx)
-{
-    fx_vault_step5_ensure_resolved(fx);
-    return fx->vault_ram_ptr && fx->vault_vmem_dev;
-}
-
 static void fx_vault_step5_set_ept_ro(FxState *fx, bool ro)
 {
     fx_vault_step5_ensure_resolved(fx);
@@ -756,12 +504,6 @@ static void fx_vault_set_requested_size(FxState *fx, uint64_t req)
     }
 }
 
-
-static uint64_t fx_round_up_u64(uint64_t x, uint64_t a)
-{
-    if (a == 0) return x;
-    return (x + a - 1) / a * a;
-}
 
 /* Resolve:
  * - memdev backend: /objects/vaultmem -> link "mem" -> MemoryRegion -> ram_ptr
@@ -858,14 +600,6 @@ static void fx_vault_step5_detach_and_invalidate(FxState *fx)
     
     /* once detached, no need to keep it RO */
     fx_vault_step5_set_ept_ro(fx, false);
-
-    /* invalidate vault state */
-    fx->vault_opid = 0;
-    fx->vault_size = 0;
-    fx->vault_data_off = 0;
-    fx->vault_blob_len = 0;
-    fx->vault_consumed_len = 0;
-    memset(fx->vault_blob, 0, sizeof(fx->vault_blob));
 }
 
 static void fx_vault_step5_ensure_resolved(FxState *fx)
@@ -1152,15 +886,6 @@ static void fx_instance_init(Object *obj)
 {
     FxState *fx = FX(obj);
     fx->card_liveness = 0xdeadbeef;
-    fx->vault_state = VAULT_STATUS_STATE_IDLE;
-    fx->vault_err   = VAULT_ERR_NONE;
-    fx->vault_cmd = 0;
-    fx->vault_opid = 0;
-    fx->vault_last_opid = 0;
-    fx->vault_next_opid = 0;
-    fx->vault_size = 0;
-    fx->vault_data_off = 0;
-    fx->vault_blob_len = 0;
     fx->vault_mr = NULL;
     fx->step1_timer = NULL;
     fx->step1_period_ms = FX_STEP1_PERIOD_MS_DEFAULT;
@@ -1171,7 +896,6 @@ static void fx_instance_init(Object *obj)
     fx->step1_wait_plug = false;
     fx->step1_plug_deadline_ns = 0;
 
-    memset(fx->vault_blob, 0, sizeof(fx->vault_blob));
 }
 
 static void fx_class_init(ObjectClass *class, const void *data)
