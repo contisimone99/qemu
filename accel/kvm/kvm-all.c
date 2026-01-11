@@ -3400,6 +3400,83 @@ static void fx_step1_init_sync_once(void)
         inited = 1;
     }
 }
+static void fx_step1_save_msrs(CPUState *cpu)
+{
+    static const uint32_t idx[FX_STEP1_NMSRS] = {
+        MSR_IA32_FS_BASE,
+        MSR_IA32_GS_BASE,
+        MSR_IA32_KERNEL_GS_BASE,
+        MSR_TSC_AUX,
+        MSR_STAR,
+        MSR_LSTAR,
+        MSR_CSTAR,
+        MSR_SYSCALL_MASK,
+        MSR_IA32_SYSENTER_CS,
+        MSR_IA32_SYSENTER_ESP,
+        MSR_IA32_SYSENTER_EIP,
+    };
+
+    struct {
+        struct kvm_msrs hdr;
+        struct kvm_msr_entry ent[FX_STEP1_NMSRS];
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.hdr.nmsrs = FX_STEP1_NMSRS;
+
+    for (uint32_t i = 0; i < FX_STEP1_NMSRS; i++) {
+        req.ent[i].index = idx[i];
+    }
+
+    int ret = kvm_vcpu_ioctl(cpu, KVM_GET_MSRS, &req);
+    if (ret < 0) {
+        fx_step1_saved.have_msrs = 0;
+        fx_step1_saved.msrs_n = 0;
+        fprintf(stderr, "[FX] Step1: KVM_GET_MSRS failed (errno=%d)\n", errno);
+        fflush(stderr);
+        return;
+    }
+
+    fx_step1_saved.have_msrs = 1;
+    fx_step1_saved.msrs_n = FX_STEP1_NMSRS;
+    memcpy(fx_step1_saved.msrs_entries, req.ent, sizeof(req.ent));
+
+    fprintf(stderr,
+            "[FX] Step1: saved MSRs ret=%d fs=0x%llx gs=0x%llx kgs=0x%llx\n",
+            ret,
+            (unsigned long long)fx_step1_saved.msrs_entries[0].data,
+            (unsigned long long)fx_step1_saved.msrs_entries[1].data,
+            (unsigned long long)fx_step1_saved.msrs_entries[2].data);
+    fflush(stderr);
+}
+
+static void fx_step1_restore_msrs(CPUState *cpu)
+{
+    if (!fx_step1_saved.have_msrs || fx_step1_saved.msrs_n != FX_STEP1_NMSRS) {
+        return;
+    }
+
+    struct {
+        struct kvm_msrs hdr;
+        struct kvm_msr_entry ent[FX_STEP1_NMSRS];
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.hdr.nmsrs = FX_STEP1_NMSRS;
+    memcpy(req.ent, fx_step1_saved.msrs_entries, sizeof(req.ent));
+
+    int ret = kvm_vcpu_ioctl(cpu, KVM_SET_MSRS, &req);
+    if (ret < 0) {
+        fprintf(stderr, "[FX] Step1: KVM_SET_MSRS failed (errno=%d)\n", errno);
+        fflush(stderr);
+        return;
+    }
+
+    fprintf(stderr, "[FX] Step1: restored MSRs ret=%d\n", ret);
+    fflush(stderr);
+}
+
+
 
 static int fx_step1_cap_xsave(void)
 {
@@ -3524,17 +3601,16 @@ static int fx_step1_start_takeover(CPUState *cpu)
     struct kvm_sregs sregs;
     struct kvm_fpu   fpu;
     void *vault_hva;
+
     fprintf(stderr, "[FX] Step1: start_takeover entered cpu_index=%d vault_gpa=0x%llx size=0x%llx\n",
         cpu->cpu_index,
         (unsigned long long)fx_step1_vault_gpa_base,
         (unsigned long long)fx_step1_vault_size);
     fflush(stderr);
-    /*if (!fx_step1_armed) {
-        return 0;
-    }*/
 
     /* Vault parameters must be set */
-    if (fx_step1_vault_gpa_base == 0 || fx_step1_vault_size < (FX_STEP1_PGT_OFF + FX_STEP1_PGT_BYTES + 0x1000)) {
+    if (fx_step1_vault_gpa_base == 0 ||
+        fx_step1_vault_size < (FX_STEP1_PGT_OFF + FX_STEP1_PGT_BYTES + 0x1000)) {
         fprintf(stderr, "[FX] Step1: invalid vault params (base=0x%llx size=0x%llx)\n",
                 (unsigned long long)fx_step1_vault_gpa_base,
                 (unsigned long long)fx_step1_vault_size);
@@ -3560,9 +3636,12 @@ static int fx_step1_start_takeover(CPUState *cpu)
     memset(&regs, 0, sizeof(regs));
     memset(&sregs, 0, sizeof(sregs));
     memset(&fpu, 0, sizeof(fpu));
-    
+
     kvm_vcpu_ioctl(cpu, KVM_GET_REGS,  &regs);
     kvm_vcpu_ioctl(cpu, KVM_GET_SREGS, &sregs);
+
+    /* NEW: Save MSRs (FS/GS/KERNEL_GS_BASE + syscall/sysenter) */
+    fx_step1_save_msrs(cpu);
 
     /* Save legacy FPU */
     fx_step1_saved.have_fpu = 0;
@@ -3598,8 +3677,6 @@ static int fx_step1_start_takeover(CPUState *cpu)
     fx_step1_saved.sregs = sregs;
     fx_step1_saved.valid = 1;
 
-
-
     /* Build temporary page tables mapping EXEC_VA -> vault */
     fx_step1_build_pagetables(vault_hva, fx_step1_vault_gpa_base);
 
@@ -3611,21 +3688,17 @@ static int fx_step1_start_takeover(CPUState *cpu)
     regs.rip = FX_STEP1_EXEC_VA + FX_STEP1_ENTRY_OFF;
     regs.rsp = FX_STEP1_EXEC_VA + FX_STEP1_STACK_OFF + FX_STEP1_STACK_SIZE - 0x10;
 
-    /*
-     * Critical: disable interrupts while running with the temporary CR3
-     * that does NOT map the kernel. Otherwise a timer interrupt/exception
-     * will try to fetch kernel handlers and can lead to #DF.
-     *
-     * We restore original RFLAGS when we restore regs at the end.
-     */
+    /* Disable interrupts during vault CR3 */
     regs.rflags &= ~X86_EFLAGS_IF;
     regs.rflags |= 0x2ULL; /* bit 1 must be set */
 
     kvm_vcpu_ioctl(cpu, KVM_SET_REGS, &regs);
+
     fprintf(stderr, "[FX] Step1: entering vault with RFLAGS=0x%llx (IF=%d)\n",
         (unsigned long long)regs.rflags,
         (int)((regs.rflags & X86_EFLAGS_IF) != 0));
     fflush(stderr);
+
     fprintf(stderr, "[FX] Step1: takeover started on cpu=%p (RIP=0x%llx RSP=0x%llx CR3=0x%llx)\n",
             (void *)cpu,
             (unsigned long long)regs.rip,
@@ -3644,8 +3717,18 @@ static void fx_step1_finish_takeover(CPUState *cpu)
         return;
     }
 
-    /* Restore order: SREGS -> REGS -> XCRS -> XSAVE -> FPU */
+    /*
+     * Restore order:
+     *   SREGS -> MSRS -> REGS -> XCRS -> XSAVE -> FPU
+     *
+     * MSRS must be restored before REGS so Linux per-cpu bases (GS/KGS) are correct
+     * when the kernel resumes.
+     */
     kvm_vcpu_ioctl(cpu, KVM_SET_SREGS, &fx_step1_saved.sregs);
+
+    /* NEW: restore MSRs */
+    fx_step1_restore_msrs(cpu);
+
     kvm_vcpu_ioctl(cpu, KVM_SET_REGS,  &fx_step1_saved.regs);
 
 #ifdef KVM_SET_XCRS
@@ -3668,11 +3751,11 @@ static void fx_step1_finish_takeover(CPUState *cpu)
     fx_step1_resume_others();
 
     fx_step1_detach_req = 1;
-    fx_vault_step1_detach_from_kvmall();
 
     fprintf(stderr, "[FX] Step1: takeover finished + restored, detach requested\n");
     fflush(stderr);
 }
+
 
 
 

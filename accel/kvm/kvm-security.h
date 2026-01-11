@@ -145,6 +145,47 @@ extern bool fx_bootstrap_valid;
 #ifndef X86_EFLAGS_IF
 #define X86_EFLAGS_IF (1ULL << 9)
 #endif
+
+
+#ifndef MSR_IA32_FS_BASE
+#define MSR_IA32_FS_BASE        0xC0000100
+#endif
+#ifndef MSR_IA32_GS_BASE
+#define MSR_IA32_GS_BASE        0xC0000101
+#endif
+#ifndef MSR_IA32_KERNEL_GS_BASE
+#define MSR_IA32_KERNEL_GS_BASE 0xC0000102
+#endif
+#ifndef MSR_TSC_AUX
+#define MSR_TSC_AUX             0xC0000103
+#endif
+
+#ifndef MSR_STAR
+#define MSR_STAR                0xC0000081
+#endif
+#ifndef MSR_LSTAR
+#define MSR_LSTAR               0xC0000082
+#endif
+#ifndef MSR_CSTAR
+#define MSR_CSTAR               0xC0000083
+#endif
+#ifndef MSR_SYSCALL_MASK
+#define MSR_SYSCALL_MASK        0xC0000084
+#endif
+
+#ifndef MSR_IA32_SYSENTER_CS
+#define MSR_IA32_SYSENTER_CS    0x00000174
+#endif
+#ifndef MSR_IA32_SYSENTER_ESP
+#define MSR_IA32_SYSENTER_ESP   0x00000175
+#endif
+#ifndef MSR_IA32_SYSENTER_EIP
+#define MSR_IA32_SYSENTER_EIP   0x00000176
+#endif
+
+#define FX_STEP1_NMSRS  11
+
+
 /*
  * These are set by the FX device when the vault is attached + payload written.
  * They live in kvm-all so that the vCPU thread can run takeover without
@@ -181,6 +222,10 @@ typedef struct FxStep1Saved {
     int have_xcrs;
 
     int valid;
+    int have_msrs;
+    uint32_t msrs_n;
+    struct kvm_msr_entry msrs_entries[FX_STEP1_NMSRS];
+
 } FxStep1Saved;
 
 static FxStep1Saved fx_step1_saved = {0};
@@ -188,6 +233,7 @@ static FxStep1Saved fx_step1_saved = {0};
 /* Forward decl: implemented in fx device (fx.c) */
 void fx_vault_step1_detach_from_kvmall(void);
 extern void fx_step1_arm_from_kvmall(void);
+
 
 
 #endif
