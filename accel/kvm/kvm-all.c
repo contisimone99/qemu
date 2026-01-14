@@ -3302,6 +3302,189 @@ static void fx_step1_restore_msrs(CPUState *cpu)
     fflush(stderr);
 }
 
+/*
+ * ============================================================
+ * FX Step1 physmap execution: clear NX on the direct-map entry
+ * ============================================================
+ *
+ * Kernel direct map is typically NX (ret2dir mitigation). When we set RIP into
+ * physmap (page_offset + GPA), the guest will fault on instruction fetch unless
+ * we temporarily clear NX on the mapping entry covering that VA.
+ *
+ * We do NOT switch CR3 and we do NOT build custom page tables:
+ * we patch the guest's own page tables (one entry) and restore it on exit.
+ */
+
+#ifndef FX_X86_PTE_PRESENT
+#define FX_X86_PTE_PRESENT   (1ULL << 0)
+#endif
+#ifndef FX_X86_PTE_PS
+#define FX_X86_PTE_PS        (1ULL << 7)
+#endif
+#ifndef FX_X86_PTE_NX
+#define FX_X86_PTE_NX        (1ULL << 63)
+#endif
+#ifndef FX_X86_ADDR_MASK
+#define FX_X86_ADDR_MASK     0x000ffffffffff000ULL
+#endif
+
+static inline bool fx_guest_read_u64(uint64_t gpa, uint64_t *out)
+{
+    void *hva = kvm_physical_memory_addr_to_host(kvm_state, (hwaddr)gpa);
+    if (!hva) {
+        return false;
+    }
+    *out = *(uint64_t *)hva;
+    return true;
+}
+
+static inline bool fx_guest_write_u64(uint64_t gpa, uint64_t val)
+{
+    void *hva = kvm_physical_memory_addr_to_host(kvm_state, (hwaddr)gpa);
+    if (!hva) {
+        return false;
+    }
+    *(uint64_t *)hva = val;
+    return true;
+}
+
+static bool fx_step1_find_leaf_entry(uint64_t cr3, uint64_t va, bool la57,
+                                     uint64_t *out_entry_gpa,
+                                     uint64_t *out_entry_val,
+                                     const char **out_level)
+{
+    uint64_t table = cr3 & ~0xfffULL;
+    uint64_t e, entry_gpa;
+
+    /* indices */
+    uint64_t idx_pml5 = (va >> 48) & 0x1ff;
+    uint64_t idx_pml4 = (va >> 39) & 0x1ff;
+    uint64_t idx_pdpt = (va >> 30) & 0x1ff;
+    uint64_t idx_pd   = (va >> 21) & 0x1ff;
+    uint64_t idx_pt   = (va >> 12) & 0x1ff;
+
+    if (la57) {
+        entry_gpa = table + idx_pml5 * 8;
+        if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
+            return false;
+        }
+        table = e & FX_X86_ADDR_MASK; /* -> PML4 */
+    }
+
+    /* PML4E */
+    entry_gpa = table + idx_pml4 * 8;
+    if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
+        return false;
+    }
+    table = e & FX_X86_ADDR_MASK; /* -> PDPT */
+
+    /* PDPTE */
+    entry_gpa = table + idx_pdpt * 8;
+    if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
+        return false;
+    }
+    if (e & FX_X86_PTE_PS) {
+        /* 1GB huge page leaf */
+        *out_entry_gpa = entry_gpa;
+        *out_entry_val = e;
+        if (out_level) {
+            *out_level = "PDPTE(1G)";
+        }
+        return true;
+    }
+    table = e & FX_X86_ADDR_MASK; /* -> PD */
+
+    /* PDE / PMD */
+    entry_gpa = table + idx_pd * 8;
+    if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
+        return false;
+    }
+    if (e & FX_X86_PTE_PS) {
+        /* 2MB huge page leaf */
+        *out_entry_gpa = entry_gpa;
+        *out_entry_val = e;
+        if (out_level) {
+            *out_level = "PDE(2M)";
+        }
+        return true;
+    }
+    table = e & FX_X86_ADDR_MASK; /* -> PT */
+
+    /* PTE */
+    entry_gpa = table + idx_pt * 8;
+    if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
+        return false;
+    }
+    *out_entry_gpa = entry_gpa;
+    *out_entry_val = e;
+    if (out_level) {
+        *out_level = "PTE(4K)";
+    }
+    return true;
+}
+
+static bool fx_step1_clear_nx_for_va(uint64_t cr3, uint64_t va, bool la57,
+                                     FxStep1Saved *saved)
+{
+    uint64_t entry_gpa = 0, oldv = 0;
+    const char *lvl = NULL;
+
+    saved->nx_patched = 0;
+    saved->nx_entry_gpa = 0;
+    saved->nx_entry_old = 0;
+
+    if (!fx_step1_find_leaf_entry(cr3, va, la57, &entry_gpa, &oldv, &lvl)) {
+        fprintf(stderr, "[FX] Step1: NX patch: page-walk failed for VA=0x%llx (la57=%d)\n",
+                (unsigned long long)va, (int)la57);
+        fflush(stderr);
+        return false;
+    }
+
+    saved->nx_entry_gpa = entry_gpa;
+    saved->nx_entry_old = oldv;
+
+    if (!(oldv & FX_X86_PTE_NX)) {
+        fprintf(stderr, "[FX] Step1: NX patch: entry already executable (%s) VA=0x%llx entry_gpa=0x%llx\n",
+                lvl ? lvl : "leaf",
+                (unsigned long long)va,
+                (unsigned long long)entry_gpa);
+        fflush(stderr);
+        return true;
+    }
+
+    uint64_t newv = oldv & ~FX_X86_PTE_NX;
+    if (!fx_guest_write_u64(entry_gpa, newv)) {
+        fprintf(stderr, "[FX] Step1: NX patch: write failed entry_gpa=0x%llx\n",
+                (unsigned long long)entry_gpa);
+        fflush(stderr);
+        return false;
+    }
+
+    saved->nx_patched = 1;
+    fprintf(stderr, "[FX] Step1: NX patch: cleared NX at %s entry_gpa=0x%llx old=0x%llx new=0x%llx\n",
+            lvl ? lvl : "leaf",
+            (unsigned long long)entry_gpa,
+            (unsigned long long)oldv,
+            (unsigned long long)newv);
+    fflush(stderr);
+    return true;
+}
+
+static void fx_step1_restore_nx(FxStep1Saved *saved)
+{
+    if (!saved->nx_patched) {
+        return;
+    }
+    if (saved->nx_entry_gpa == 0) {
+        return;
+    }
+    (void)fx_guest_write_u64(saved->nx_entry_gpa, saved->nx_entry_old);
+    fprintf(stderr, "[FX] Step1: NX patch: restored entry_gpa=0x%llx val=0x%llx\n",
+            (unsigned long long)saved->nx_entry_gpa,
+            (unsigned long long)saved->nx_entry_old);
+    fflush(stderr);
+    saved->nx_patched = 0;
+}
 
 
 static int fx_step1_cap_xsave(void)
@@ -3415,37 +3598,7 @@ static bool fx_step1_is_cpl0(CPUState *cpu, uint8_t *out_cpl)
 }
 
 
-/* Build temporary page tables in-vault mapping EXEC_VA -> vault_gpa_base using 2MiB page */
-static void fx_step1_build_pagetables(void *vault_hva, uint64_t vault_gpa_base)
-{
-    uint8_t *base = (uint8_t *)vault_hva;
 
-    uint64_t *pml4 = (uint64_t *)(base + FX_STEP1_PGT_OFF + 0x0000);
-    uint64_t *pdpt = (uint64_t *)(base + FX_STEP1_PGT_OFF + 0x1000);
-    uint64_t *pd   = (uint64_t *)(base + FX_STEP1_PGT_OFF + 0x2000);
-
-    memset(pml4, 0, FX_STEP1_PGT_BYTES);
-
-    /* Indices for FX_STEP1_EXEC_VA */
-    const uint64_t pml4_i = (FX_STEP1_EXEC_VA >> 39) & 0x1FF;
-    const uint64_t pdpt_i = (FX_STEP1_EXEC_VA >> 30) & 0x1FF;
-    const uint64_t pd_i   = (FX_STEP1_EXEC_VA >> 21) & 0x1FF;
-
-    /* Physical addresses of paging structures (guest physical == vault_gpa_base + offsets) */
-    const uint64_t pdpt_pa = vault_gpa_base + FX_STEP1_PGT_OFF + 0x1000;
-    const uint64_t pd_pa   = vault_gpa_base + FX_STEP1_PGT_OFF + 0x2000;
-
-    const uint64_t flags = 0x003ULL; /* Present | RW */
-    pml4[pml4_i] = pdpt_pa | flags;
-    pdpt[pdpt_i] = pd_pa   | flags;
-
-    /*
-     * 2MiB page mapping:
-     * PD entry with PS=1 maps [VA .. VA+2MiB) -> [PA .. PA+2MiB)
-     */
-    const uint64_t pa_2m_aligned = vault_gpa_base & ~0x1FFFFFULL;
-    pd[pd_i] = pa_2m_aligned | flags | (1ULL << 7); /* PS */
-}
 
 /* Start takeover on the current vCPU (target) */
 static int fx_step1_start_takeover(CPUState *cpu)
@@ -3453,7 +3606,7 @@ static int fx_step1_start_takeover(CPUState *cpu)
     struct kvm_regs  regs;
     struct kvm_sregs sregs;
     struct kvm_fpu   fpu;
-    void *vault_hva;
+    uint64_t vault_va_base;
 
     fprintf(stderr, "[FX] Step1: start_takeover entered cpu_index=%d vault_gpa=0x%llx size=0x%llx\n",
         cpu->cpu_index,
@@ -3462,8 +3615,7 @@ static int fx_step1_start_takeover(CPUState *cpu)
     fflush(stderr);
 
     /* Vault parameters must be set */
-    if (fx_step1_vault_gpa_base == 0 ||
-        fx_step1_vault_size < (FX_STEP1_PGT_OFF + FX_STEP1_PGT_BYTES + 0x1000)) {
+    if (fx_step1_vault_gpa_base == 0) {
         fprintf(stderr, "[FX] Step1: invalid vault params (base=0x%llx size=0x%llx)\n",
                 (unsigned long long)fx_step1_vault_gpa_base,
                 (unsigned long long)fx_step1_vault_size);
@@ -3472,11 +3624,31 @@ static int fx_step1_start_takeover(CPUState *cpu)
         return 0;
     }
 
-    /* Resolve HVA for vault base so we can build page tables */
-    vault_hva = kvm_physical_memory_addr_to_host(kvm_state, (hwaddr)fx_step1_vault_gpa_base);
-    if (!vault_hva) {
-        fprintf(stderr, "[FX] Step1: vault_hva NULL for gpa=0x%llx\n",
-                (unsigned long long)fx_step1_vault_gpa_base);
+       /*
+     * execute from the kernel direct map (physmap) without
+     * switching CR3 and without building custom page tables.
+     *
+     * VA = physmap_base + PA (guest-physical == GPA in this context).
+     */
+    if (!fx_bootstrap_valid) {
+        fprintf(stderr, "[FX] Step1: bootstrap not valid, refusing takeover\n");
+         fflush(stderr);
+         fx_step1_armed = 0;
+         return 0;
+     }
+ 
+    if (fx_bootstrap_info.page_offset == 0) {
+        fprintf(stderr, "[FX] Step1: physmap base (page_offset) missing/zero\n");
+        fflush(stderr);
+        fx_step1_armed = 0;
+        return 0;
+    }
+
+    /* Ensure the vault is large enough for entry + stack region. */
+    if (fx_step1_vault_size < (FX_STEP1_STACK_OFF + FX_STEP1_STACK_SIZE)) {
+        fprintf(stderr, "[FX] Step1: vault too small for layout (size=0x%llx need>=0x%llx)\n",
+                (unsigned long long)fx_step1_vault_size,
+                (unsigned long long)(FX_STEP1_STACK_OFF + FX_STEP1_STACK_SIZE));
         fflush(stderr);
         fx_step1_armed = 0;
         return 0;
@@ -3530,16 +3702,42 @@ static int fx_step1_start_takeover(CPUState *cpu)
     fx_step1_saved.sregs = sregs;
     fx_step1_saved.valid = 1;
 
-    /* Build temporary page tables mapping EXEC_VA -> vault */
-    fx_step1_build_pagetables(vault_hva, fx_step1_vault_gpa_base);
+   
+    /*
+     * Physmap execution requires temporarily clearing NX on the leaf mapping
+     * that covers the vault VA (direct map is typically NX).
+     *
+     * NOTE: We patch the guest page tables (single entry) and restore on exit.
+     */
+    if (!fx_bootstrap_valid || fx_bootstrap_info.page_offset == 0) {
+        fprintf(stderr, "[FX] Step1: NX patch: missing bootstrap/page_offset, refusing takeover\n");
+        fflush(stderr);
+        fx_step1_resume_others();
+        fx_step1_saved.valid = 0;
+        return 0;
+    }
 
-    /* Switch CR3 to our in-vault PML4 */
-    sregs.cr3 = fx_step1_vault_gpa_base + FX_STEP1_PGT_OFF;
-    kvm_vcpu_ioctl(cpu, KVM_SET_SREGS, &sregs);
+    /* Compute vault VA inside physmap (direct map). */
+    vault_va_base = fx_bootstrap_info.page_offset + fx_step1_vault_gpa_base;
+    fprintf(stderr, "[FX] Step1: using physmap VA base=0x%llx (physmap=0x%llx + gpa=0x%llx)\n",
+            (unsigned long long)vault_va_base,
+            (unsigned long long)fx_bootstrap_info.page_offset,
+            (unsigned long long)fx_step1_vault_gpa_base);
+    fflush(stderr);
+
+    if (!fx_step1_clear_nx_for_va(fx_step1_saved.sregs.cr3, vault_va_base,
+                                  (fx_bootstrap_info.la57 != 0),
+                                  &fx_step1_saved)) {
+        fprintf(stderr, "[FX] Step1: NX patch failed, aborting takeover\n");
+        fflush(stderr);
+        fx_step1_resume_others();
+        fx_step1_saved.valid = 0;
+        return 0;
+    }
 
     /* Set RIP/RSP within the temporary mapping */
-    regs.rip = FX_STEP1_EXEC_VA + FX_STEP1_ENTRY_OFF;
-    regs.rsp = FX_STEP1_EXEC_VA + FX_STEP1_STACK_OFF + FX_STEP1_STACK_SIZE - 0x10;
+    regs.rip = vault_va_base + FX_STEP1_ENTRY_OFF;
+    regs.rsp = vault_va_base + FX_STEP1_STACK_OFF + FX_STEP1_STACK_SIZE - 0x10;
 
     /* Disable interrupts during vault CR3 */
     regs.rflags &= ~X86_EFLAGS_IF;
@@ -3552,11 +3750,11 @@ static int fx_step1_start_takeover(CPUState *cpu)
         (int)((regs.rflags & X86_EFLAGS_IF) != 0));
     fflush(stderr);
 
-    fprintf(stderr, "[FX] Step1: takeover started on cpu=%p (RIP=0x%llx RSP=0x%llx CR3=0x%llx)\n",
-            (void *)cpu,
-            (unsigned long long)regs.rip,
-            (unsigned long long)regs.rsp,
-            (unsigned long long)sregs.cr3);
+    fprintf(stderr, "[FX] Step1: takeover started on cpu=%p (RIP=0x%llx RSP=0x%llx CR3=0x%llx [unchanged])\n",
+             (void *)cpu,
+             (unsigned long long)regs.rip,
+             (unsigned long long)regs.rsp,
+            (unsigned long long)fx_step1_saved.sregs.cr3);
     fflush(stderr);
 
     /* Armed consumed: now we are running */
@@ -3569,6 +3767,12 @@ static void fx_step1_finish_takeover(CPUState *cpu)
     if (!fx_step1_saved.valid) {
         return;
     }
+
+    /*
+     * Restore NX before resuming guest execution.
+     * This keeps the direct-map NX mitigation intact outside the window.
+     */
+    fx_step1_restore_nx(&fx_step1_saved);
 
     /*
      * Restore order:

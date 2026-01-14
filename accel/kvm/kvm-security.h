@@ -101,15 +101,16 @@ extern bool fx_bootstrap_valid;
 /* I/O port used by the vault payload to signal completion */
 #define FX_MAGIC_PORT_DONE           0x00F1
 
-/* We execute the payload at a fixed VA using a temporary CR3 built in-vault */
-#define FX_STEP1_EXEC_VA             0x0000000040000000ULL /* 1 GiB VA */
+/*
+ * Execute from kernel direct map (physmap):
+ *   vault_va_base = page_offset + vault_gpa_base
+ * CR3 is left unchanged (no in-vault page tables).
+ */
 #define FX_STEP1_ENTRY_OFF           0x0000ULL
 #define FX_STEP1_STACK_OFF           0x4000ULL
 #define FX_STEP1_STACK_SIZE          0x1000ULL
 
-/* Where we build temporary page tables inside vault */
-#define FX_STEP1_PGT_OFF             0x8000ULL /* must be 4K-aligned */
-#define FX_STEP1_PGT_BYTES           0x3000ULL /* PML4+PDPT+PD */
+
 #ifndef X86_EFLAGS_IF
 #define X86_EFLAGS_IF (1ULL << 9)
 #endif
@@ -193,6 +194,9 @@ typedef struct FxStep1Saved {
     int have_msrs;
     uint32_t msrs_n;
     struct kvm_msr_entry msrs_entries[FX_STEP1_NMSRS];
+    int nx_patched;
+    uint64_t nx_entry_gpa;
+    uint64_t nx_entry_old;
 
 } FxStep1Saved;
 
