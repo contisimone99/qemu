@@ -3388,6 +3388,33 @@ static void fx_step1_resume_others(void)
     qemu_mutex_unlock(&fx_step1_pause_mtx);
 }
 
+static bool fx_step1_is_cpl0(CPUState *cpu, uint8_t *out_cpl)
+{
+#if defined(TARGET_X86_64) || defined(TARGET_I386)
+    struct kvm_sregs sregs;
+    memset(&sregs, 0, sizeof(sregs));
+    if (kvm_vcpu_ioctl(cpu, KVM_GET_SREGS, &sregs) < 0) {
+        fprintf(stderr, "[FX] Step1: KVM_GET_SREGS failed while checking CPL (errno=%d)\n", errno);
+        fflush(stderr);
+        return false;
+    }
+    uint8_t cpl = (uint8_t)(sregs.cs.selector & 0x3);
+    fprintf(stderr,"[FX] Step1: current CPL=%d\n", cpl);
+    fflush(stderr);
+    if (out_cpl) {
+        *out_cpl = cpl;
+    }
+    return cpl == 0;
+#else
+    /* Non-x86 targets: CPL concept does not apply. Treat as allowed. */
+    if (out_cpl) {
+        *out_cpl = 0;
+    }
+    return true;
+#endif
+}
+
+
 /* Build temporary page tables in-vault mapping EXEC_VA -> vault_gpa_base using 2MiB page */
 static void fx_step1_build_pagetables(void *vault_hva, uint64_t vault_gpa_base)
 {
@@ -3835,9 +3862,26 @@ int kvm_cpu_exec(CPUState *cpu)
         */
         int claimed = (qatomic_cmpxchg(&fx_step1_armed, 1, 0) == 1);
         if (claimed) {
-            fprintf(stderr, "[FX] Step1: claimed by cpu_index=%d\n", cpu->cpu_index);
-            fflush(stderr);
-            fx_step1_start_takeover(cpu);
+            uint8_t cpl = 0xff;
+            if (!fx_step1_is_cpl0(cpu, &cpl)) {
+                /*
+                 * Not in kernel mode yet: do NOT stop-the-world and do NOT take over.
+                 * Re-arm so we can retry on a future safe point.
+                 */
+                static uint64_t fx_step1_cpl_miss;
+                fx_step1_cpl_miss++;
+                if ((fx_step1_cpl_miss & 0x3ff) == 1) {
+                    fprintf(stderr,
+                            "[FX] Step1: CPL gating blocked takeover on cpu_index=%d (CPL=%u), re-arming\n",
+                            cpu->cpu_index, cpl);
+                    fflush(stderr);
+                }
+                qatomic_set(&fx_step1_armed, 1);
+            } else {
+                fprintf(stderr, "[FX] Step1: claimed by cpu_index=%d (CPL=0)\n", cpu->cpu_index);
+                fflush(stderr);
+                fx_step1_start_takeover(cpu);
+            }
         }
 
         
