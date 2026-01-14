@@ -3625,14 +3625,17 @@ static void execute_hypercall(CPUState *cpu)
         memcpy(&fx_bootstrap_info, guest_ptr, sizeof(fx_bootstrap_info));
         fx_bootstrap_valid = true;
         fprintf(stderr,
-            "[FX] BOOTSTRAP_INFO received: init_task=0x%llx off_tasks=0x%x off_pid=0x%x off_comm=0x%x comm_len=%u task_struct_size=%u abi=%u\n",
+            "[FX] BOOTSTRAP_INFO received: init_task=0x%llx off_tasks=0x%x off_pid=0x%x off_comm=0x%x comm_len=%u task_struct_size=%u abi=%u cr3_pa=0x%llx la57=%u page_offset=0x%llx\n",
             (unsigned long long)fx_bootstrap_info.init_task_addr,
             fx_bootstrap_info.off_tasks,
             fx_bootstrap_info.off_pid,
             fx_bootstrap_info.off_comm,
             fx_bootstrap_info.comm_len,
             fx_bootstrap_info.task_struct_size,
-            fx_bootstrap_info.abi
+            fx_bootstrap_info.abi,
+            (unsigned long long)fx_bootstrap_info.kernel_cr3_pa,
+            fx_bootstrap_info.la57,
+            (unsigned long long)fx_bootstrap_info.page_offset
         );
         fflush(stderr);
         break;

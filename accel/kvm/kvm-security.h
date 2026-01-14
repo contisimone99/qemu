@@ -60,10 +60,31 @@ struct timespec begin;
 /* variables for data received from self-unload guest module*/
 typedef struct FxBootstrapInfo {
     uint64_t init_task_addr;
+
+    /* task_struct layout */
     uint32_t off_tasks;
     uint32_t off_pid;
     uint32_t off_comm;
     uint32_t comm_len;
+
+    /* file-descriptor related layout */
+    uint32_t off_files;
+    uint32_t off_files_fdt;
+    uint32_t off_fdt_max_fds;
+    uint32_t off_fdt_fd;
+    uint32_t off_file_inode;
+    uint32_t off_inode_mode;
+
+    /* paging context hints */
+    uint64_t kernel_cr3_pa;
+    uint64_t kernel_cr4;
+    uint32_t la57;
+    uint32_t pcid;
+
+    /* sanity / constants */
+    uint64_t init_task_pa;
+    uint64_t page_offset;
+
     uint32_t task_struct_size;
     uint32_t abi;
     uint32_t reserved;
