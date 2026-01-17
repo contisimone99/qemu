@@ -67,14 +67,6 @@ typedef struct FxBootstrapInfo {
     uint32_t off_comm;
     uint32_t comm_len;
 
-    /* file-descriptor related layout */
-    uint32_t off_files;
-    uint32_t off_files_fdt;
-    uint32_t off_fdt_max_fds;
-    uint32_t off_fdt_fd;
-    uint32_t off_file_inode;
-    uint32_t off_inode_mode;
-
     /* paging context hints */
     uint64_t kernel_cr3_pa;
     uint64_t kernel_cr4;
@@ -86,8 +78,6 @@ typedef struct FxBootstrapInfo {
     uint64_t page_offset;
 
     uint32_t task_struct_size;
-    uint32_t abi;
-    uint32_t reserved;
 } __attribute__((packed)) FxBootstrapInfo;
 
 static FxBootstrapInfo fx_bootstrap_info;
@@ -108,9 +98,19 @@ extern bool fx_bootstrap_valid;
  * CR3 is left unchanged (no in-vault page tables).
  */
 #define FX_STEP1_ENTRY_OFF           0x0000ULL
-#define FX_STEP1_STACK_OFF           0x0000ULL
-#define FX_STEP1_STACK_SIZE          0x2000ULL
+#define FX_STEP1_STACK_OFF           0x10000ULL   /* stack starts after outbuf */
+#define FX_STEP1_STACK_SIZE          0x10000ULL   /* 64KB stack */
 #define FX_STEP1_STACK_TOP_OFF       (FX_STEP1_STACK_OFF + FX_STEP1_STACK_SIZE)
+
+
+/* === Step 5 mailbox + bigger stack layout (inside STACK vault, RW EPT) === */
+#define FX_STEP1_OUTBUF_OFF          0x0000ULL
+#define FX_STEP1_OUTBUF_SIZE         0x10000ULL   /* 64KB output buffer */
+
+
+/* Export used by kvm-all.c on DONE to print mailbox */
+void fx_step5_dump_mailbox_from_kvmall(void);
+uint32_t fx_step5_get_comm_len_from_kvmall(void);
 
 
 #ifndef X86_EFLAGS_IF

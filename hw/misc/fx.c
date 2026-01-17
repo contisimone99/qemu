@@ -46,8 +46,14 @@ DECLARE_INSTANCE_CHECKER(FxState, FX,
 
 #define FX_MAGIC_PORT_DONE           0x00F1
 #define FX_STEP1_ENTRY_OFF           0x0000ULL
-#define FX_STEP1_STACK_OFF           0x0000ULL
-#define FX_STEP1_STACK_SIZE          0x2000ULL
+
+/* Step5: mailbox + stack dentro la STACK vault (RW EPT) */
+#define FX_STEP1_OUTBUF_OFF          0x0000ULL
+#define FX_STEP1_OUTBUF_SIZE         0x10000ULL   /* 64KB mailbox */
+
+#define FX_STEP1_STACK_OFF           0x10000ULL   /* stack dopo mailbox */
+#define FX_STEP1_STACK_SIZE          0x10000ULL   /* 64KB stack */
+#define FX_STEP1_STACK_TOP_OFF       (FX_STEP1_STACK_OFF + FX_STEP1_STACK_SIZE)
 
 /* ===== Step1 periodic loop (attach/run/detach repeatedly) ===== */
 #define FX_STEP1_PERIOD_MS_DEFAULT      3000   /* 3s between windows */
@@ -69,6 +75,7 @@ extern uint64_t fx_step1_stack_gpa_base;
 extern uint64_t fx_step1_stack_size;
 extern volatile int fx_step1_armed;
 extern volatile int fx_step1_detach_req;
+extern uint32_t fx_step5_get_comm_len_from_kvmall(void);
 
 
 /* Set to true after BOOTSTRAP_INFO is received/validated by KVM side */
@@ -177,40 +184,118 @@ static uint64_t fx_vmem_get_plugged_size(DeviceState *vmem)
 /* Step1 exports called from kvm-all.c */
 void fx_step1_arm_from_kvmall(void);
 void fx_vault_step1_detach_from_kvmall(void);
-
+void fx_step5_dump_mailbox_from_kvmall(void);
 static void fx_step1_write_payload(FxState *fx)
 {
-    /*
-     * 16-bit compatible payload (also valid in 64-bit mode):
-     *   mov dx, imm16
-     *   mov al, 0x01
-     *   out dx, al
-     *   hlt
-     */
-    static const uint8_t payload[] = {
-        0x66, 0xBA, (uint8_t)(FX_MAGIC_PORT_DONE & 0xFF), (uint8_t)((FX_MAGIC_PORT_DONE >> 8) & 0xFF), /* mov dx, imm16 */
-        0xB0, 0x01,             /* mov al, 1 */
-        0xEE,                   /* out dx, al */
-        0xF4                    /* hlt */
-    };
+    /* See payload.S in Thesis repo */
+/* FX_PAYLOAD_BLOB_BEGIN */
+static const uint8_t payload[] = {
+      0x55, 0x48, 0x89, 0xe5, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41,
+      0x57, 0x49, 0x89, 0xf4, 0x49, 0x89, 0xd5, 0x49, 0x89, 0xce, 0x45, 0x89,
+      0xc7, 0x4c, 0x89, 0xcb, 0x48, 0x85, 0xff, 0x74, 0x56, 0x45, 0x85, 0xff,
+      0x74, 0x51, 0x41, 0x81, 0xff, 0x00, 0x01, 0x00, 0x00, 0x77, 0x48, 0x48,
+      0x89, 0xf8, 0x57, 0x4a, 0x8b, 0x04, 0x20, 0x48, 0x85, 0xc0, 0x74, 0x29,
+      0x4c, 0x29, 0xe0, 0x48, 0x85, 0xc0, 0x74, 0x21, 0x48, 0x3b, 0x04, 0x24,
+      0x74, 0x1b, 0x42, 0x8b, 0x0c, 0x28, 0x89, 0x0b, 0x48, 0x83, 0xc3, 0x04,
+      0x4a, 0x8d, 0x34, 0x30, 0x48, 0x89, 0xdf, 0x44, 0x89, 0xf9, 0xf3, 0xa4,
+      0x4c, 0x01, 0xfb, 0xeb, 0xce, 0x48, 0x83, 0xc4, 0x08, 0xc7, 0x03, 0xff,
+      0xff, 0xff, 0xff, 0x66, 0x44, 0x89, 0xd2, 0xb0, 0x01, 0xee, 0xf4, 0xc7,
+      0x03, 0xff, 0xff, 0xff, 0xff, 0x66, 0x44, 0x89, 0xd2, 0xb0, 0x01, 0xee,
+      0xf4
+};
+/* FX_PAYLOAD_BLOB_END */
 
     if (!fx->vault_code_ram_ptr || fx->vault_code_ram_size < 0x1000) {
-        fprintf(stderr, "fx: step1 payload: vault CODE ram_ptr NULL or too small\n");
-         return;
-     }
-    if (!fx->vault_stack_ram_ptr || fx->vault_stack_ram_size < FX_STEP1_STACK_SIZE) {
-        fprintf(stderr, "fx: step1 payload: vault STACK ram_ptr NULL or too small\n");
+        fprintf(stderr, "fx: step5 payload: vault CODE ram_ptr NULL or too small\n");
+        return;
+    }
+    if (!fx->vault_stack_ram_ptr || fx->vault_stack_ram_size < (FX_STEP1_STACK_TOP_OFF + 0x1000)) {
+        fprintf(stderr, "fx: step5 payload: vault STACK ram_ptr NULL or too small\n");
+        return;
+    }
+    if (sizeof(payload) == 0) {
+        fprintf(stderr, "fx: step5 payload: payload[] is empty (paste bytes!)\n");
         return;
     }
 
-    /* code at 0x0000 */
+    /* CODE at entry offset */
     memcpy((uint8_t *)fx->vault_code_ram_ptr + FX_STEP1_ENTRY_OFF, payload, sizeof(payload));
 
-    /* stack: zero it (separate RW vault) */
-    memset((uint8_t *)fx->vault_stack_ram_ptr + FX_STEP1_STACK_OFF, 0, FX_STEP1_STACK_SIZE);
+    /* Zero output buffer + stack area (both live in STACK vault, RW) */
+    memset((uint8_t *)fx->vault_stack_ram_ptr + FX_STEP1_OUTBUF_OFF, 0, FX_STEP1_OUTBUF_SIZE);
+    memset((uint8_t *)fx->vault_stack_ram_ptr + FX_STEP1_STACK_OFF,  0, FX_STEP1_STACK_SIZE);
 
-    fprintf(stderr, "fx: step1 payload written (len=%zu)\n", sizeof(payload));
+    fprintf(stderr, "fx: step5 payload written (len=%zu), outbuf=0x%llx size=0x%llx stack_off=0x%llx stack_size=0x%llx\n",
+            sizeof(payload),
+            (unsigned long long)FX_STEP1_OUTBUF_OFF,
+            (unsigned long long)FX_STEP1_OUTBUF_SIZE,
+            (unsigned long long)FX_STEP1_STACK_OFF,
+            (unsigned long long)FX_STEP1_STACK_SIZE);
 }
+
+void fx_step5_dump_mailbox_from_kvmall(void)
+{
+    FxState *fx = fx_global_singleton;
+    const uint8_t *p;
+    const uint8_t *end;
+    uint32_t pid;
+    char comm[257];
+    uint32_t comm_len;
+    uint32_t count = 0;
+    if (!fx || !fx->vault_stack_ram_ptr || fx->vault_stack_ram_size == 0) {
+        fprintf(stderr, "[FX] Step5: mailbox dump: stack vault not available\n");
+        return;
+    }
+
+    if (!fx_bootstrap_valid) {
+        fprintf(stderr, "[FX] Step5: mailbox dump: bootstrap not valid\n");
+        return;
+    }
+
+    comm_len = fx_step5_get_comm_len_from_kvmall();
+    if (comm_len == 0 || comm_len > 256) {
+        fprintf(stderr, "[FX] Step5: mailbox dump: invalid comm_len=%u\n", comm_len);
+        return;
+    }
+
+    p   = (const uint8_t *)fx->vault_stack_ram_ptr + FX_STEP1_OUTBUF_OFF;
+    end = p + FX_STEP1_OUTBUF_SIZE;
+
+    fprintf(stderr, "[FX] Step5: mailbox dump BEGIN (comm_len=%u)\n", comm_len);
+
+    while (p + 4 <= end) {
+        pid = *(const uint32_t *)p;
+        p += 4;
+
+        if (pid == 0xFFFFFFFFu) {
+            fprintf(stderr, "[FX] Step5: mailbox terminator reached\n");
+            break;
+        }
+        count++;
+        if (p + comm_len > end) {
+            fprintf(stderr, "[FX] Step5: mailbox truncated (pid=%u)\n", pid);
+            break;
+        }
+
+        /* copy and printable sanitize */
+        memset(comm, 0, sizeof(comm));
+        memcpy(comm, p, comm_len);
+        comm[comm_len] = '\0';
+        for (uint32_t i = 0; i < comm_len; i++) {
+            unsigned char c = (unsigned char)comm[i];
+            if (c == 0) break;
+            if (!isprint(c)) comm[i] = '.';
+        }
+
+        fprintf(stderr, "  pid=%u comm=%s\n", pid, comm);
+
+        p += comm_len;
+    }
+    fprintf(stderr, "[FX] Step5: total processes dumped = %u\n", count);
+    fprintf(stderr, "[FX] Step5: mailbox dump END\n");
+}
+
+
 
 static void fx_step1_arm_if_ready(FxState *fx)
 {

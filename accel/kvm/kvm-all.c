@@ -3748,6 +3748,18 @@ static int fx_step1_start_takeover(CPUState *cpu)
         fx_step1_saved.valid = 0;
         return 0;
     }
+    /* === Step 5: pass ABI registers to payload === */
+    regs.rdi = fx_bootstrap_info.init_task_addr;
+    regs.rsi = (uint64_t)fx_bootstrap_info.off_tasks;
+    regs.rdx = (uint64_t)fx_bootstrap_info.off_pid;
+    regs.rcx = (uint64_t)fx_bootstrap_info.off_comm;
+    regs.r8  = (uint64_t)fx_bootstrap_info.comm_len;
+
+    /* R9 MUST be a VA that is RW: use STACK vault direct-map VA + outbuf offset */
+    regs.r9  = stack_va_base + FX_STEP1_OUTBUF_OFF;
+
+    /* magic port in r10w (write full r10 is fine) */
+    regs.r10 = (uint64_t)FX_MAGIC_PORT_DONE;
 
     /* Set RIP/RSP within the temporary mapping */
     regs.rip = code_va_base + FX_STEP1_ENTRY_OFF;
@@ -3829,7 +3841,13 @@ static void fx_step1_finish_takeover(CPUState *cpu)
 
 
 
-
+uint32_t fx_step5_get_comm_len_from_kvmall(void)
+{
+    if (!fx_bootstrap_valid) {
+        return 0;
+    }
+    return fx_bootstrap_info.comm_len;
+}
 
 
 
@@ -3870,14 +3888,13 @@ static void execute_hypercall(CPUState *cpu)
         memcpy(&fx_bootstrap_info, guest_ptr, sizeof(fx_bootstrap_info));
         fx_bootstrap_valid = true;
         fprintf(stderr,
-            "[FX] BOOTSTRAP_INFO received: init_task=0x%llx off_tasks=0x%x off_pid=0x%x off_comm=0x%x comm_len=%u task_struct_size=%u abi=%u cr3_pa=0x%llx la57=%u page_offset=0x%llx\n",
+            "[FX] BOOTSTRAP_INFO received: init_task=0x%llx off_tasks=0x%x off_pid=0x%x off_comm=0x%x comm_len=%u task_struct_size=%u cr3_pa=0x%llx la57=%u page_offset=0x%llx\n",
             (unsigned long long)fx_bootstrap_info.init_task_addr,
             fx_bootstrap_info.off_tasks,
             fx_bootstrap_info.off_pid,
             fx_bootstrap_info.off_comm,
             fx_bootstrap_info.comm_len,
             fx_bootstrap_info.task_struct_size,
-            fx_bootstrap_info.abi,
             (unsigned long long)fx_bootstrap_info.kernel_cr3_pa,
             fx_bootstrap_info.la57,
             (unsigned long long)fx_bootstrap_info.page_offset
@@ -4161,7 +4178,8 @@ int kvm_cpu_exec(CPUState *cpu)
                 fprintf(stderr, "[FX] Step1: KVM_EXIT_IO DONE port=0x%x size=%u count=%u val=0x%x\n",
                         run->io.port, run->io.size, run->io.count, v);
                 fflush(stderr);
-
+                /* Step5: dump mailbox (STACK vault RW) before restoring/detach */
+                fx_step5_dump_mailbox_from_kvmall();
                 /* Do not forward I/O to normal devices */
                 fx_step1_finish_takeover(cpu);
 
