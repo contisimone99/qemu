@@ -103,12 +103,14 @@ extern bool fx_bootstrap_valid;
 
 /*
  * Execute from kernel direct map (physmap):
- *   vault_va_base = page_offset + vault_gpa_base
+ *   code_va_base  = page_offset + code_gpa_base
+ *   stack_va_base = page_offset + stack_gpa_base
  * CR3 is left unchanged (no in-vault page tables).
  */
 #define FX_STEP1_ENTRY_OFF           0x0000ULL
-#define FX_STEP1_STACK_OFF           0x4000ULL
-#define FX_STEP1_STACK_SIZE          0x1000ULL
+#define FX_STEP1_STACK_OFF           0x0000ULL
+#define FX_STEP1_STACK_SIZE          0x2000ULL
+#define FX_STEP1_STACK_TOP_OFF       (FX_STEP1_STACK_OFF + FX_STEP1_STACK_SIZE)
 
 
 #ifndef X86_EFLAGS_IF
@@ -160,8 +162,10 @@ extern bool fx_bootstrap_valid;
  * They live in kvm-all so that the vCPU thread can run takeover without
  * additional plumbing.
  */
-uint64_t fx_step1_vault_gpa_base = 0;
-uint64_t fx_step1_vault_size     = 0;
+uint64_t fx_step1_code_gpa_base  = 0;
+uint64_t fx_step1_code_size      = 0;
+uint64_t fx_step1_stack_gpa_base = 0;
+uint64_t fx_step1_stack_size     = 0;
 volatile int fx_step1_armed      = 0;
 
 /* Request from KVM side to detach vault after step completion */

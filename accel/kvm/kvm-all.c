@@ -3606,19 +3606,25 @@ static int fx_step1_start_takeover(CPUState *cpu)
     struct kvm_regs  regs;
     struct kvm_sregs sregs;
     struct kvm_fpu   fpu;
-    uint64_t vault_va_base;
+    uint64_t code_va_base;
+    uint64_t stack_va_base;
 
-    fprintf(stderr, "[FX] Step1: start_takeover entered cpu_index=%d vault_gpa=0x%llx size=0x%llx\n",
+
+    fprintf(stderr, "[FX] Step1: start_takeover entered cpu_index=%d code_gpa=0x%llx code_size=0x%llx stack_gpa=0x%llx stack_size=0x%llx\n",
         cpu->cpu_index,
-        (unsigned long long)fx_step1_vault_gpa_base,
-        (unsigned long long)fx_step1_vault_size);
+        (unsigned long long)fx_step1_code_gpa_base,
+        (unsigned long long)fx_step1_code_size,
+        (unsigned long long)fx_step1_stack_gpa_base,
+        (unsigned long long)fx_step1_stack_size);
     fflush(stderr);
 
     /* Vault parameters must be set */
-    if (fx_step1_vault_gpa_base == 0) {
-        fprintf(stderr, "[FX] Step1: invalid vault params (base=0x%llx size=0x%llx)\n",
-                (unsigned long long)fx_step1_vault_gpa_base,
-                (unsigned long long)fx_step1_vault_size);
+    if (fx_step1_code_gpa_base == 0 || fx_step1_stack_gpa_base == 0) {
+        fprintf(stderr, "[FX] Step1: invalid vault params (code_gpa=0x%llx code_size=0x%llx stack_gpa=0x%llx stack_size=0x%llx)\n",
+                (unsigned long long)fx_step1_code_gpa_base,
+                (unsigned long long)fx_step1_code_size,
+                (unsigned long long)fx_step1_stack_gpa_base,
+                (unsigned long long)fx_step1_stack_size);
         fflush(stderr);
         fx_step1_armed = 0;
         return 0;
@@ -3644,11 +3650,18 @@ static int fx_step1_start_takeover(CPUState *cpu)
         return 0;
     }
 
-    /* Ensure the vault is large enough for entry + stack region. */
-    if (fx_step1_vault_size < (FX_STEP1_STACK_OFF + FX_STEP1_STACK_SIZE)) {
-        fprintf(stderr, "[FX] Step1: vault too small for layout (size=0x%llx need>=0x%llx)\n",
-                (unsigned long long)fx_step1_vault_size,
-                (unsigned long long)(FX_STEP1_STACK_OFF + FX_STEP1_STACK_SIZE));
+    /* Ensure CODE and STACK vaults are large enough for the layout. */
+    if (fx_step1_code_size < 0x1000) {
+        fprintf(stderr, "[FX] Step1: code vault too small (size=0x%llx)\n",
+                (unsigned long long)fx_step1_code_size);
+        fflush(stderr);
+        fx_step1_armed = 0;
+        return 0;
+    }
+    if (fx_step1_stack_size < FX_STEP1_STACK_TOP_OFF) {
+        fprintf(stderr, "[FX] Step1: stack vault too small (size=0x%llx need>=0x%llx)\n",
+                (unsigned long long)fx_step1_stack_size,
+                (unsigned long long)FX_STEP1_STACK_TOP_OFF);
         fflush(stderr);
         fx_step1_armed = 0;
         return 0;
@@ -3717,15 +3730,16 @@ static int fx_step1_start_takeover(CPUState *cpu)
         return 0;
     }
 
-    /* Compute vault VA inside physmap (direct map). */
-    vault_va_base = fx_bootstrap_info.page_offset + fx_step1_vault_gpa_base;
-    fprintf(stderr, "[FX] Step1: using physmap VA base=0x%llx (physmap=0x%llx + gpa=0x%llx)\n",
-            (unsigned long long)vault_va_base,
-            (unsigned long long)fx_bootstrap_info.page_offset,
-            (unsigned long long)fx_step1_vault_gpa_base);
+    /* Compute CODE/STACK VA inside physmap (direct map). */
+    code_va_base  = fx_bootstrap_info.page_offset + fx_step1_code_gpa_base;
+    stack_va_base = fx_bootstrap_info.page_offset + fx_step1_stack_gpa_base;
+    fprintf(stderr, "[FX] Step1: using physmap code_va=0x%llx stack_va=0x%llx (physmap=0x%llx)\n",
+            (unsigned long long)code_va_base,
+            (unsigned long long)stack_va_base,
+            (unsigned long long)fx_bootstrap_info.page_offset);
     fflush(stderr);
 
-    if (!fx_step1_clear_nx_for_va(fx_step1_saved.sregs.cr3, vault_va_base,
+    if (!fx_step1_clear_nx_for_va(fx_step1_saved.sregs.cr3, code_va_base,
                                   (fx_bootstrap_info.la57 != 0),
                                   &fx_step1_saved)) {
         fprintf(stderr, "[FX] Step1: NX patch failed, aborting takeover\n");
@@ -3736,8 +3750,8 @@ static int fx_step1_start_takeover(CPUState *cpu)
     }
 
     /* Set RIP/RSP within the temporary mapping */
-    regs.rip = vault_va_base + FX_STEP1_ENTRY_OFF;
-    regs.rsp = vault_va_base + FX_STEP1_STACK_OFF + FX_STEP1_STACK_SIZE - 0x10;
+    regs.rip = code_va_base + FX_STEP1_ENTRY_OFF;
+    regs.rsp = stack_va_base + FX_STEP1_STACK_TOP_OFF - 0x10;
 
     /* Disable interrupts during vault CR3 */
     regs.rflags &= ~X86_EFLAGS_IF;
