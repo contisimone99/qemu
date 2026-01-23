@@ -17,7 +17,7 @@
 #include "hw/boards.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
-
+#include <stdbool.h>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -37,59 +37,53 @@ DECLARE_INSTANCE_CHECKER(FxState, FX,
 #define INTERRUPT_ACK_REGISTER      0x64
 
 
-#define VAULT_CMD_REGISTER           0xA0
-#define VAULT_STATUS_REGISTER        0xA4
-#define VAULT_LAST_OPID_REGISTER     0xA8
-#define VAULT_SIZE_REGISTER          0xAC  /* write: payload size required */
-#define VAULT_DATA_RESET_REGISTER    0xB0  /* write: reset read cursor */
-#define VAULT_DATA_REGISTER          0xB4  /* read: stream u32 header+payload */
-#define VAULT_DLEN_REGISTER          0xB8  /* read: total available length (header+payload) */
-#define VAULT_ERR_REGISTER           0xBC  /* read-only: last error code */
-
-/* status bitfield */
-#define VAULT_STATUS_STATE_MASK      0x3
-#define VAULT_STATUS_STATE_IDLE      0x0
-#define VAULT_STATUS_STATE_READY     0x1
-#define VAULT_STATUS_STATE_ERROR     0x2
-#define VAULT_STATUS_BLOB_PRESENT    (1u << 2)
-#define VAULT_STATUS_BUSY            (1u << 3)
-
-/* Step 5 (virtio-mem) */
-#define VAULT_VMEM_ID_DEFAULT        "vault0"
-#define VAULT_MEMDEV_ID_DEFAULT      "vaultmem"
+/* (virtio-mem) */
+#define VAULT_CODE_VMEM_ID_DEFAULT        "vault0"
+#define VAULT_CODE_MEMDEV_ID_DEFAULT      "vaultmem_code"
+#define VAULT_STACK_VMEM_ID_DEFAULT       "vault1"
+#define VAULT_STACK_MEMDEV_ID_DEFAULT     "vaultmem_stack"
 #define VAULT_VMEM_BLOCK_SIZE        (128 * 1024 * 1024ULL) /* must match runall.sh block-size */
 
+#define FX_MAGIC_PORT_DONE           0x00F1
+#define FX_ENTRY_OFF           0x0000ULL
 
-/* error codes */
-#define VAULT_ERR_NONE               0
-#define VAULT_ERR_BAD_STATE          1
-#define VAULT_ERR_BAD_PARAMS         2
-#define VAULT_ERR_DONE_EARLY         3
-#define VAULT_ERR_UNKNOWN_CMD        4
+/*:mailbox + stack dentro la STACK vault (RW EPT) */
+#define FX_OUTBUF_OFF          0x0000ULL
+#define FX_OUTBUF_SIZE         0x10000ULL   /* 64KB mailbox */
 
+#define FX_STACK_OFF           0x10000ULL   /* stack dopo mailbox */
+#define FX_STACK_SIZE          0x10000ULL   /* 64KB stack */
+#define FX_STACK_TOP_OFF       (FX_STACK_OFF + FX_STACK_SIZE)
 
-
-
-#define VAULT_CMD_PREPARE            0x1
-#define VAULT_CMD_DONE               0x2
-#define VAULT_CMD_FAIL               0x3   /* Step 2: guest signals validation fail */
-#define VAULT_CMD_RESET              0x4   /* Step 3.x: recovery to IDLE */
-
-
-
-#define VAULT_ST_IDLE                0x0
-#define VAULT_ST_READY               0x1
-#define VAULT_ST_ERROR               0xFF
-
-#define VAULT_MAGIC                  0x30544C56u /* 'V' 'L' 'T' '0' */
-#define VAULT_HDR_SIZE               16
-#define VAULT_MAX_PAYLOAD            2048
-#define VAULT_MAX_BLOB               (VAULT_HDR_SIZE + VAULT_MAX_PAYLOAD)
-
-
+/* =====  periodic loop (attach/run/detach repeatedly) ===== */
+#define FX_PERIOD_MS_DEFAULT      30000   /* 30s between windows */
+#define FX_ARM_SETTLE_MS          300    /* wait after attach before expecting takeover */
+#define FX_WINDOW_TIMEOUT_MS      2000  /* fail-closed if stuck */
+#define FX_DETACH_COOLDOWN_MS  800
+#define FX_DETACH_POLL_MS        50     /* poll plugged size */
+#define FX_UNPLUG_TIMEOUT_MS     5000   /* max wait for size->0 */
+#define FX_PLUG_POLL_MS        20
+#define FX_PLUG_TIMEOUT_MS     5000
 
 #define CONF_INTERVAL_DEFAULT       10
 #define CONF_SERVER_PORT            3333
+/* ===== FX  interface to kvm-all ===== */
+extern bool fx_bootstrap_valid;                 /* set by BOOTSTRAP_INFO hypercall handler */
+extern uint64_t fx_code_gpa_base;
+extern uint64_t fx_code_size;
+extern uint64_t fx_stack_gpa_base;
+extern uint64_t fx_stack_size;
+extern volatile int fx_armed;
+extern volatile int fx_detach_req;
+extern uint32_t fx_get_comm_len_from_kvmall(void);
+
+
+/* Set to true after BOOTSTRAP_INFO is received/validated by KVM side */
+bool fx_bootstrap_valid = false;
+/* Must match runall.sh memaddr for virtio-mem */
+#define FX_VAULT_CODE_GPA_BASE_DEFAULT   0x100000000ULL
+#define FX_VAULT_STACK_GPA_BASE_DEFAULT  0x108000000ULL
+
 
 struct FxState {
     PCIDevice pdev;
@@ -103,24 +97,25 @@ struct FxState {
 
     uint32_t irq_status;
     uint32_t card_liveness;
-    uint32_t vault_state;
-    uint32_t vault_err;
-    uint32_t vault_cmd;
-    uint32_t vault_opid;
-    uint32_t vault_last_opid;
-    uint32_t vault_next_opid;
-    uint32_t vault_size;
-    uint32_t vault_data_off;      /* Step1-4 cursor: no longer used in Step5 */
-    uint32_t vault_blob_len;
-    uint32_t vault_consumed_len;  /* Step5: guest writes consumed blob_len here */
-    uint8_t  vault_blob[VAULT_MAX_BLOB];
 
-    /* Step5: virtio-mem plumbing */
-    void     *vault_ram_ptr;      /* host ptr to memory-backend-ram */
-    uint64_t vault_ram_size;
-    MemoryRegion *vault_mr;       /* MemoryRegion of /objects/vaultmem */
-    DeviceState *vault_vmem_dev;  /* virtio-mem-pci device (id=vault0) */
+    void       *vault_code_ram_ptr;
+    uint64_t    vault_code_ram_size;
+    MemoryRegion *vault_code_mr;
+    DeviceState *vault_code_vmem_dev;
 
+    void       *vault_stack_ram_ptr;
+    uint64_t    vault_stack_ram_size;
+    MemoryRegion *vault_stack_mr;
+    DeviceState *vault_stack_vmem_dev;
+    /*  periodic runner */
+    QEMUTimer *_timer;
+    uint32_t   _period_ms;
+    int64_t    _deadline_ns;   /* when current window must complete */
+    bool       _inflight;      /* true after we armed, until detach */
+    bool       _wait_unplug;
+    int64_t    _unplug_deadline_ns;
+    bool      _wait_plug;
+    int64_t   _plug_deadline_ns;
 
     QemuMutex conf_mutex;
     unsigned int conf_sleep_interval;
@@ -144,30 +139,192 @@ static void conf_server_init(void *);
 static void conf_server_uninit(void *);
 static void accept_conf_server_callback(void *);
 static void read_conf_server_callback(void *);
-static bool fx_vault_step5_ready(FxState *);
-static void fx_vault_set_requested_size(FxState *, uint64_t);
-static void fx_vault_step5_detach_and_invalidate(FxState *);
-static uint64_t fx_round_up_u64(uint64_t, uint64_t);
-static void fx_vault_step5_resolve(FxState *);
-static void fx_vault_step5_ensure_resolved(FxState *);
-static void fx_vault_step5_set_ept_ro(FxState *, bool);
+static void fx_vault_set_requested_size(FxState *, DeviceState *, uint64_t);
+static void fx_vault_detach_and_invalidate(FxState *);
+static void fx_vault_resolve(FxState *);
+static void fx_vault_ensure_resolved(FxState *);
+static void fx_vault_set_ept_ro_code(FxState *, bool);
+static void fx_periodic_init(FxState *fx);
+static void fx_periodic_uninit(FxState *fx);
+static void fx_timer_cb(void *opaque);
+static void fx_force_detach_reset(FxState *fx, const char *why);
 
-static inline void vault_put_le32(uint8_t *p, uint32_t v)
+/* ===== FX  prototypes / forward decls ===== */
+
+/* singleton device instance (set in realize) */
+static FxState *fx_global_singleton;
+
+/* helpers used by arm/detach */
+
+
+static uint64_t fx_vmem_get_plugged_size(DeviceState *vmem)
 {
-    p[0] = (uint8_t)(v & 0xFF);
-    p[1] = (uint8_t)((v >> 8) & 0xFF);
-    p[2] = (uint8_t)((v >> 16) & 0xFF);
-    p[3] = (uint8_t)((v >> 24) & 0xFF);
+    Error *local_err = NULL;
+    uint64_t sz = 0;
+
+    if (!vmem) {
+        return 0;
+    }
+
+    /* Virtio-mem exposes "size" as current plugged size */
+    sz = object_property_get_uint(OBJECT(vmem), "size", &local_err);
+    if (local_err) {
+        fprintf(stderr, "fx: virtio-mem: cannot read property 'size': %s\n",
+                error_get_pretty(local_err));
+        error_free(local_err);
+        return 0;
+    }
+
+    return sz;
 }
 
-static inline uint32_t fx_vault_status_word(FxState *fx)
+
+
+
+/*  exports called from kvm-all.c */
+void fx_arm_from_kvmall(void);
+void fx_vault_detach_from_kvmall(void);
+void fx_dump_mailbox_from_kvmall(void);
+static void fx_write_payload(FxState *fx)
 {
-    uint32_t st = (fx->vault_state & VAULT_STATUS_STATE_MASK);
-    if (fx->vault_blob_len != 0) {
-        st |= VAULT_STATUS_BLOB_PRESENT;
+    /* See payload.S in Thesis repo */
+/* FX_PAYLOAD_BLOB_BEGIN */
+static const uint8_t payload[] = {
+      0x55, 0x48, 0x89, 0xe5, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41,
+      0x57, 0x49, 0x89, 0xf4, 0x49, 0x89, 0xd5, 0x49, 0x89, 0xce, 0x45, 0x89,
+      0xc7, 0x4c, 0x89, 0xcb, 0x48, 0x85, 0xff, 0x74, 0x56, 0x45, 0x85, 0xff,
+      0x74, 0x51, 0x41, 0x81, 0xff, 0x00, 0x01, 0x00, 0x00, 0x77, 0x48, 0x48,
+      0x89, 0xf8, 0x57, 0x4a, 0x8b, 0x04, 0x20, 0x48, 0x85, 0xc0, 0x74, 0x29,
+      0x4c, 0x29, 0xe0, 0x48, 0x85, 0xc0, 0x74, 0x21, 0x48, 0x3b, 0x04, 0x24,
+      0x74, 0x1b, 0x42, 0x8b, 0x0c, 0x28, 0x89, 0x0b, 0x48, 0x83, 0xc3, 0x04,
+      0x4a, 0x8d, 0x34, 0x30, 0x48, 0x89, 0xdf, 0x44, 0x89, 0xf9, 0xf3, 0xa4,
+      0x4c, 0x01, 0xfb, 0xeb, 0xce, 0x48, 0x83, 0xc4, 0x08, 0xc7, 0x03, 0xff,
+      0xff, 0xff, 0xff, 0x66, 0x44, 0x89, 0xd2, 0xb0, 0x01, 0xee, 0xf4, 0xc7,
+      0x03, 0xff, 0xff, 0xff, 0xff, 0x66, 0x44, 0x89, 0xd2, 0xb0, 0x01, 0xee,
+      0xf4
+};
+/* FX_PAYLOAD_BLOB_END */
+
+    if (!fx->vault_code_ram_ptr || fx->vault_code_ram_size < 0x1000) {
+        fprintf(stderr, "fx: payload: vault CODE ram_ptr NULL or too small\n");
+        return;
     }
-    /* busy per ora sempre 0 */
-    return st;
+    if (!fx->vault_stack_ram_ptr || fx->vault_stack_ram_size < (FX_STACK_TOP_OFF + 0x1000)) {
+        fprintf(stderr, "fx: payload: vault STACK ram_ptr NULL or too small\n");
+        return;
+    }
+    if (sizeof(payload) == 0) {
+        fprintf(stderr, "fx: payload: payload[] is empty (paste bytes!)\n");
+        return;
+    }
+
+    /* CODE at entry offset */
+    memcpy((uint8_t *)fx->vault_code_ram_ptr + FX_ENTRY_OFF, payload, sizeof(payload));
+
+    /* Zero output buffer + stack area (both live in STACK vault, RW) */
+    memset((uint8_t *)fx->vault_stack_ram_ptr + FX_OUTBUF_OFF, 0, FX_OUTBUF_SIZE);
+    memset((uint8_t *)fx->vault_stack_ram_ptr + FX_STACK_OFF,  0, FX_STACK_SIZE);
+
+
+}
+
+void fx_dump_mailbox_from_kvmall(void)
+{
+    FxState *fx = fx_global_singleton;
+    const uint8_t *p;
+    const uint8_t *end;
+    uint32_t pid;
+    char comm[257];
+    uint32_t comm_len;
+    uint32_t count = 0;
+    if (!fx || !fx->vault_stack_ram_ptr || fx->vault_stack_ram_size == 0) {
+        fprintf(stderr, "[FX]:mailbox dump: stack vault not available\n");
+        return;
+    }
+
+    if (!fx_bootstrap_valid) {
+        fprintf(stderr, "[FX]:mailbox dump: bootstrap not valid\n");
+        return;
+    }
+
+    comm_len = fx_get_comm_len_from_kvmall();
+    if (comm_len == 0 || comm_len > 256) {
+        fprintf(stderr, "[FX]:mailbox dump: invalid comm_len=%u\n", comm_len);
+        return;
+    }
+
+    p   = (const uint8_t *)fx->vault_stack_ram_ptr + FX_OUTBUF_OFF;
+    end = p + FX_OUTBUF_SIZE;
+
+
+    while (p + 4 <= end) {
+        pid = *(const uint32_t *)p;
+        p += 4;
+
+        if (pid == 0xFFFFFFFFu) {
+            fprintf(stderr, "[FX]:mailbox terminator reached\n");
+            break;
+        }
+        count++;
+        if (p + comm_len > end) {
+            fprintf(stderr, "[FX]:mailbox truncated (pid=%u)\n", pid);
+            break;
+        }
+
+        /* copy and printable sanitize */
+        memset(comm, 0, sizeof(comm));
+        memcpy(comm, p, comm_len);
+        comm[comm_len] = '\0';
+        for (uint32_t i = 0; i < comm_len; i++) {
+            unsigned char c = (unsigned char)comm[i];
+            if (c == 0) break;
+            if (!isprint(c)) comm[i] = '.';
+        }
+
+        fprintf(stderr, "  pid=%u comm=%s\n", pid, comm);
+
+        p += comm_len;
+    }
+}
+
+
+
+static void fx_arm_if_ready(FxState *fx)
+{
+    if (!fx_bootstrap_valid) {
+        fprintf(stderr, "fx arm blocked: bootstrap not valid yet\n");
+        return;
+    }
+
+    fx_vault_ensure_resolved(fx);
+
+    if (!fx->vault_code_ram_ptr || !fx->vault_stack_ram_ptr ||
+        !fx->vault_code_vmem_dev || !fx->vault_stack_vmem_dev) {
+        fprintf(stderr, "fx arm failed: CODE/STACK virtio-mem/memdev not resolved\n");
+        return;
+    }
+    
+    /* Fail-closed: CODE must be EPT RO during the window */
+    fx_vault_set_ept_ro_code(fx, true);
+    /*
+     * Attach vault memory (requested-size > 0)
+     * Use one block for .
+     */
+    fx_vault_set_requested_size(fx, fx->vault_code_vmem_dev,  VAULT_VMEM_BLOCK_SIZE);
+    fx_vault_set_requested_size(fx, fx->vault_stack_vmem_dev, VAULT_VMEM_BLOCK_SIZE);
+
+    /* Write minimal payload into vault RAM backend */
+    fx_write_payload(fx);
+
+    /* We requested the plug, now wait for guest to complete hotplug */
+    fx->_wait_plug = true;
+    fx->_plug_deadline_ns =
+        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + (int64_t)FX_PLUG_TIMEOUT_MS * 1000000LL;
+
+    /* DO NOT publish to takeover engine yet */
+    fx_armed = 0;
+
+
 }
 
 static const MemoryRegionOps fx_mmio_ops = {
@@ -230,18 +387,6 @@ static uint64_t fx_mmio_read(void *opaque, hwaddr addr, unsigned size)
         case INTERRUPT_STATUS_REGISTER:
             val = fx->irq_status;
             break;
-        case VAULT_STATUS_REGISTER:
-            val = fx_vault_status_word(fx);
-            break;
-        case VAULT_ERR_REGISTER:
-            val = fx->vault_err;
-            break;
-        case VAULT_LAST_OPID_REGISTER:
-            val = fx->vault_last_opid;
-            break;
-        case VAULT_DLEN_REGISTER:
-            val = fx->vault_blob_len;
-            break;
         default:
             break;
         }
@@ -273,159 +418,6 @@ static void fx_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case INTERRUPT_ACK_REGISTER:
         fx_lower_irq(fx, val);
-        break;
-
-
-    case VAULT_CMD_REGISTER:
-        fx->vault_cmd = (uint32_t)val;
-
-        if (fx->vault_cmd == VAULT_CMD_PREPARE) {
-
-            /* Enforce state machine: PREPARE only from IDLE */
-            if (fx->vault_state != VAULT_STATUS_STATE_IDLE) {
-                    fx->vault_state = VAULT_STATUS_STATE_ERROR;
-                    fx->vault_err = VAULT_ERR_BAD_STATE;
-                    fprintf(stderr,
-                            "fx_mmio_write: VAULT_CMD_PREPARE rejected (not IDLE). status=%u\n",
-                            fx->vault_state);
-                    break;
-            }
-    
-
-            if (fx->vault_size == 0 || fx->vault_size > VAULT_MAX_PAYLOAD) {
-                    fx->vault_state = VAULT_STATUS_STATE_ERROR;
-                    fx->vault_err = VAULT_ERR_BAD_PARAMS;
-                    fprintf(stderr,
-                            "fx_mmio_write: VAULT_CMD_PREPARE invalid params opid=%u size=%u\n",
-                            fx->vault_opid, fx->vault_size);
-                    break;
-            }
-
-            /* build blob: [header|payload] */
-            fx->vault_data_off = 0;
-            fx->vault_blob_len = VAULT_HDR_SIZE + fx->vault_size;
-            fx->vault_opid = ++fx->vault_next_opid;
-            vault_put_le32(&fx->vault_blob[0],  VAULT_MAGIC);
-            vault_put_le32(&fx->vault_blob[4],  fx->vault_opid);
-            vault_put_le32(&fx->vault_blob[8],  fx->vault_size);
-            vault_put_le32(&fx->vault_blob[12], 0);
-
-            for (uint32_t i = 0; i < fx->vault_size; i++) {
-                fx->vault_blob[VAULT_HDR_SIZE + i] = (uint8_t)(i & 0xFF);
-            }
-            fx_vault_step5_ensure_resolved(fx);
-
-            /* Step 5: write blob into vaultmem and hotplug via virtio-mem requested-size */
-            if (!fx_vault_step5_ready(fx)) {
-                fx->vault_state = VAULT_STATUS_STATE_ERROR;
-                fx->vault_err = VAULT_ERR_BAD_STATE;
-                fprintf(stderr, "fx_mmio_write: PREPARE failed (step5 not ready: memdev/virtio-mem unresolved)\n");
-                break;
-            }
-
-            if (fx->vault_blob_len > fx->vault_ram_size) {
-                fx->vault_state = VAULT_STATUS_STATE_ERROR;
-                fx->vault_err = VAULT_ERR_BAD_PARAMS;
-                fprintf(stderr, "fx_mmio_write: PREPARE failed (blob_len=%u > vault_ram_size=%" PRIu64 ")\n",
-                        fx->vault_blob_len, fx->vault_ram_size);
-                break;
-            }
-
-            /* copy into backend RAM (offset 0) */
-            memcpy(fx->vault_ram_ptr, fx->vault_blob, fx->vault_blob_len);
-            /*
-             * Step 5 hardening: set EPT RO before hotplugging via virtio-mem.
-             * This ensures memslots are created as READONLY (EPT RO) from the start.
-             */
-            fx_vault_step5_set_ept_ro(fx, true);
-
-            /* attach only what is needed (rounded to virtio-mem block size) */
-            uint64_t req = fx_round_up_u64((uint64_t)fx->vault_blob_len, VAULT_VMEM_BLOCK_SIZE);
-            fx_vault_set_requested_size(fx, req);
-
-            /* reset consumed_len enforcement */
-            fx->vault_consumed_len = 0;
-
-
-
-            fx->vault_last_opid = fx->vault_opid;
-            fx->vault_state = VAULT_STATUS_STATE_READY;
-            fx->vault_err = VAULT_ERR_NONE;
-            fprintf(stderr,
-                    "fx_mmio_write: VAULT_CMD_PREPARE accepted opid=%u size=%u blob_len=%u\n",
-                    fx->vault_opid, fx->vault_size, fx->vault_blob_len);
-
-        } else if (fx->vault_cmd == VAULT_CMD_DONE) {
-
-            fprintf(stderr,
-                    "fx_mmio_write: VAULT_CMD_DONE received opid=%u (consumed=%u blob_len=%u vault_state=%u)\n",
-                    fx->vault_opid, fx->vault_consumed_len, fx->vault_blob_len, fx->vault_state);
-
-            /*
-            * Step 3.2: accept DONE only if the guest fully consumed the blob.
-            * Fail-closed on early DONE.
-            */
-            if (fx->vault_state != VAULT_STATUS_STATE_READY || fx->vault_consumed_len != fx->vault_blob_len) {
-                fprintf(stderr,
-                        "fx_mmio_write: DONE rejected (not fully consumed). consumed=%u blob_len=%u -> ERROR + invalidate\n",
-                        fx->vault_consumed_len, fx->vault_blob_len);
-
-                fx->vault_state = VAULT_STATUS_STATE_ERROR;
-                fx->vault_err = VAULT_ERR_BAD_STATE;
-
-                /* detach + invalidate */
-                fx_vault_step5_detach_and_invalidate(fx);
-                break;
-            }
-
-            /* OK path: detach + invalidate and return to IDLE */
-            fx->vault_state = VAULT_STATUS_STATE_IDLE;
-            fx->vault_err = VAULT_ERR_NONE;
-            fx_vault_step5_detach_and_invalidate(fx);
-        } else if (fx->vault_cmd == VAULT_CMD_FAIL) {
-
-            fprintf(stderr,
-                    "fx_mmio_write: VAULT_CMD_FAIL received opid=%u. Mark ERROR + invalidate.\n",
-                    fx->vault_opid);
-
-            /* fail-closed: mark error + detach + invalidate */
-            fx->vault_state = VAULT_STATUS_STATE_ERROR;
-            fx->vault_err = VAULT_ERR_BAD_PARAMS;
-
-            fx_vault_step5_detach_and_invalidate(fx);
-        } else if (fx->vault_cmd == VAULT_CMD_RESET) {
-
-            fprintf(stderr,
-                    "fx_mmio_write: VAULT_CMD_RESET received. Force IDLE + detach + invalidate.\n");
-
-            fx->vault_state = VAULT_STATUS_STATE_IDLE;
-            fx->vault_err = VAULT_ERR_NONE;
-
-            fx_vault_step5_detach_and_invalidate(fx);
-            }
-        else {
-            
-            fx->vault_state = VAULT_STATUS_STATE_ERROR;
-            fx->vault_err = VAULT_ERR_UNKNOWN_CMD;
-            fprintf(stderr,
-                    "fx_mmio_write: VAULT_CMD unknown=%u -> ERROR\n",
-                    fx->vault_cmd);
-        }
-        break;
-
-    case VAULT_SIZE_REGISTER:
-        fx->vault_size = (uint32_t)val;
-        break;
-    
-    case VAULT_DATA_REGISTER:
-        /* Step 5: guest writes how many bytes were consumed (enforcement for DONE) */
-        fx->vault_consumed_len = (uint32_t)val;
-        break;
-
-    case VAULT_DATA_RESET_REGISTER:
-        if (fx->vault_state == VAULT_STATUS_STATE_READY) {
-            fx->vault_data_off = 0;
-        }
         break;      
     default:
         break;
@@ -560,18 +552,12 @@ static void read_conf_server_callback(void *opaque)
     close(fx->conn_fd);
 }
 
-static bool fx_vault_step5_ready(FxState *fx)
+static void fx_vault_set_ept_ro_code(FxState *fx, bool ro)
 {
-    fx_vault_step5_ensure_resolved(fx);
-    return fx->vault_ram_ptr && fx->vault_vmem_dev;
-}
+    fx_vault_ensure_resolved(fx);
 
-static void fx_vault_step5_set_ept_ro(FxState *fx, bool ro)
-{
-    fx_vault_step5_ensure_resolved(fx);
-
-    if (!fx->vault_mr) {
-        fprintf(stderr, "fx: vault_mr not resolved, cannot set EPT RO=%d\n", ro ? 1 : 0);
+    if (!fx->vault_code_mr) {
+        fprintf(stderr, "fx: vault_code_mr not resolved, cannot set EPT RO=%d\n", ro ? 1 : 0);
         return;
     }
 
@@ -579,27 +565,21 @@ static void fx_vault_step5_set_ept_ro(FxState *fx, bool ro)
      * This toggles MemoryRegion->readonly. Under KVM, that maps to KVM_MEM_READONLY
      * on the memslot(s), i.e. EPT read-only from the guest POV.
      */
-    memory_region_set_readonly(fx->vault_mr, ro);
-    fprintf(stderr, "fx: vaultmem MemoryRegion readonly=%d (EPT RO)\n", ro ? 1 : 0);
+    memory_region_set_readonly(fx->vault_code_mr, ro);
 }
 
 
-static void fx_vault_set_requested_size(FxState *fx, uint64_t req)
+static void fx_vault_set_requested_size(FxState *fx, DeviceState *vmem, uint64_t req)
 {
     Error *local_err = NULL;
 
-    /* lazy resolve: virtio-mem might not be ready during fx realize */
-    if (!fx->vault_vmem_dev) {
-        fx_vault_step5_ensure_resolved(fx);
-    }
-
-    if (!fx->vault_vmem_dev) {
+    if (!vmem) {
         /* IMPORTANT: RESET/FAIL might call this before virtio-mem exists; don't hard-fail. */
         fprintf(stderr, "fx: virtio-mem device not resolved, cannot set requested-size\n");
         return;
     }
 
-    object_property_set_int(OBJECT(fx->vault_vmem_dev), "requested-size", (int64_t)req, &local_err);
+    object_property_set_int(OBJECT(vmem), "requested-size", (int64_t)req, &local_err);
     if (local_err) {
         fprintf(stderr, "fx: failed setting virtio-mem requested-size=%" PRIu64 "\n", req);
         error_free(local_err);
@@ -607,39 +587,35 @@ static void fx_vault_set_requested_size(FxState *fx, uint64_t req)
 }
 
 
-static uint64_t fx_round_up_u64(uint64_t x, uint64_t a)
-{
-    if (a == 0) return x;
-    return (x + a - 1) / a * a;
-}
-
 /* Resolve:
- * - memdev backend: /objects/vaultmem -> link "mem" -> MemoryRegion -> ram_ptr
- * - virtio-mem device: qdev_find_recursive(machine, "vault0")
+ * - memdev backend: /objects/vaultmem_code  -> MemoryRegion -> ram_ptr
+ * - memdev backend: /objects/vaultmem_stack -> MemoryRegion -> ram_ptr
+ * - virtio-mem devices: qdev_find_recursive(..., "vault0") and "vault1"
  */
-static void fx_vault_step5_resolve(FxState *fx)
+static void fx_vault_resolve(FxState *fx)
 {
 
-        /* 1) resolve memdev backend (HostMemoryBackend API) */
+    /* 1) resolve CODE memdev backend */
     {
-        Object *memdev_obj = object_resolve_path("/objects/" VAULT_MEMDEV_ID_DEFAULT, NULL);
+        Object *memdev_obj = object_resolve_path("/objects/" VAULT_CODE_MEMDEV_ID_DEFAULT, NULL);
 
-        fprintf(stderr, "fx: resolving memdev path: /objects/%s -> %s\n",
-                VAULT_MEMDEV_ID_DEFAULT, memdev_obj ? "FOUND" : "NOT FOUND");
+
 
         if (!memdev_obj) {
-            fprintf(stderr, "fx: cannot resolve memdev /objects/%s\n", VAULT_MEMDEV_ID_DEFAULT);
-            fx->vault_ram_ptr = NULL;
-            fx->vault_ram_size = 0;
-            goto out_memdev;
+            fprintf(stderr, "fx: cannot resolve memdev /objects/%s\n", VAULT_CODE_MEMDEV_ID_DEFAULT);
+            fx->vault_code_ram_ptr = NULL;
+            fx->vault_code_ram_size = 0;
+            fx->vault_code_mr = NULL;
+            goto out_code_memdev;
         }
 
         if (!object_dynamic_cast(memdev_obj, TYPE_MEMORY_BACKEND)) {
             fprintf(stderr, "fx: /objects/%s is not a HostMemoryBackend (type=%s)\n",
-                    VAULT_MEMDEV_ID_DEFAULT, object_get_typename(memdev_obj));
-            fx->vault_ram_ptr = NULL;
-            fx->vault_ram_size = 0;
-            goto out_memdev;
+                    VAULT_CODE_MEMDEV_ID_DEFAULT, object_get_typename(memdev_obj));
+            fx->vault_code_ram_ptr = NULL;
+            fx->vault_code_ram_size = 0;
+            fx->vault_code_mr = NULL;
+            goto out_code_memdev;
         }
 
         HostMemoryBackend *backend = MEMORY_BACKEND(memdev_obj);
@@ -647,53 +623,109 @@ static void fx_vault_step5_resolve(FxState *fx)
 
         if (!mr) {
             fprintf(stderr, "fx: host_memory_backend_get_memory() returned NULL for %s\n",
-                    VAULT_MEMDEV_ID_DEFAULT);
-            fx->vault_ram_ptr = NULL;
-            fx->vault_ram_size = 0;
-            goto out_memdev;
+                    VAULT_CODE_MEMDEV_ID_DEFAULT);
+            fx->vault_code_ram_ptr = NULL;
+            fx->vault_code_ram_size = 0;
+            fx->vault_code_mr = NULL;
+            goto out_code_memdev;
         }
-        fx->vault_mr = mr;
+        fx->vault_code_mr = mr;
 
-        fx->vault_ram_ptr = memory_region_get_ram_ptr(mr);
-        fx->vault_ram_size = memory_region_size(mr);
+        fx->vault_code_ram_ptr = memory_region_get_ram_ptr(mr);
+        fx->vault_code_ram_size = memory_region_size(mr);
 
-        if (!fx->vault_ram_ptr || fx->vault_ram_size == 0) {
+        if (!fx->vault_code_ram_ptr || fx->vault_code_ram_size == 0) {
             fprintf(stderr, "fx: memdev resolved but ram_ptr/size invalid (ptr=%p size=%" PRIu64 ")\n",
-                    fx->vault_ram_ptr, fx->vault_ram_size);
-            fx->vault_ram_ptr = NULL;
-            fx->vault_mr = NULL;
-            fx->vault_ram_size = 0;
-            goto out_memdev;
+                    fx->vault_code_ram_ptr, fx->vault_code_ram_size);
+            fx->vault_code_ram_ptr = NULL;
+            fx->vault_code_mr = NULL;
+            fx->vault_code_ram_size = 0;
+            goto out_code_memdev;
         }
 
-        fprintf(stderr, "fx: vaultmem resolved ram_ptr=%p size=%" PRIu64 "\n",
-                fx->vault_ram_ptr, fx->vault_ram_size);
 
-out_memdev:
+out_code_memdev:
         ;
     }
 
-
-    /* 2) resolve virtio-mem device by id using qdev_find_recursive from sysbus root */
+    /* 1b) resolve STACK memdev backend */
     {
-        BusState *root = sysbus_get_default();
-        DeviceState *vmem = NULL;
+        Object *memdev_obj = object_resolve_path("/objects/" VAULT_STACK_MEMDEV_ID_DEFAULT, NULL);
 
+
+        if (!memdev_obj) {
+            fprintf(stderr, "fx: cannot resolve memdev /objects/%s\n", VAULT_STACK_MEMDEV_ID_DEFAULT);
+            fx->vault_stack_ram_ptr = NULL;
+            fx->vault_stack_ram_size = 0;
+            fx->vault_stack_mr = NULL;
+            goto out_stack_memdev;
+        }
+
+        if (!object_dynamic_cast(memdev_obj, TYPE_MEMORY_BACKEND)) {
+            fprintf(stderr, "fx: /objects/%s is not a HostMemoryBackend (type=%s)\n",
+                    VAULT_STACK_MEMDEV_ID_DEFAULT, object_get_typename(memdev_obj));
+            fx->vault_stack_ram_ptr = NULL;
+            fx->vault_stack_ram_size = 0;
+            fx->vault_stack_mr = NULL;
+            goto out_stack_memdev;
+        }
+
+        HostMemoryBackend *backend = MEMORY_BACKEND(memdev_obj);
+        MemoryRegion *mr = host_memory_backend_get_memory(backend);
+
+        if (!mr) {
+            fprintf(stderr, "fx: host_memory_backend_get_memory() returned NULL for %s\n",
+                    VAULT_STACK_MEMDEV_ID_DEFAULT);
+            fx->vault_stack_ram_ptr = NULL;
+            fx->vault_stack_ram_size = 0;
+            fx->vault_stack_mr = NULL;
+            goto out_stack_memdev;
+        }
+        fx->vault_stack_mr = mr;
+        fx->vault_stack_ram_ptr = memory_region_get_ram_ptr(mr);
+        fx->vault_stack_ram_size = memory_region_size(mr);
+
+        if (!fx->vault_stack_ram_ptr || fx->vault_stack_ram_size == 0) {
+            fprintf(stderr, "fx: memdev resolved but ram_ptr/size invalid (ptr=%p size=%" PRIu64 ")\n",
+                    fx->vault_stack_ram_ptr, fx->vault_stack_ram_size);
+            fx->vault_stack_ram_ptr = NULL;
+            fx->vault_stack_ram_size = 0;
+            fx->vault_stack_mr = NULL;
+            goto out_stack_memdev;
+        }
+
+
+out_stack_memdev:
+        ;
+    }
+    /* 2) resolve virtio-mem devices by id using qdev_find_recursive from sysbus root */
+    {
+        BusState *root;
+        DeviceState *vmem_code;
+        DeviceState *vmem_stack;
+
+        root = sysbus_get_default();
         if (!root) {
             fprintf(stderr, "fx: sysbus_get_default() returned NULL, cannot resolve virtio-mem\n");
             goto out;
         }
 
-        vmem = qdev_find_recursive(root, VAULT_VMEM_ID_DEFAULT);
-        if (!vmem) {
-            fprintf(stderr, "fx: cannot resolve virtio-mem device id=%s via sysbus recursive search\n",
-                    VAULT_VMEM_ID_DEFAULT);
+        vmem_code = qdev_find_recursive(root, VAULT_CODE_VMEM_ID_DEFAULT);
+        if (!vmem_code) {
+            fprintf(stderr, "fx: cannot resolve virtio-mem CODE device id=%s via sysbus recursive search\n",
+                    VAULT_CODE_VMEM_ID_DEFAULT);
+            goto out;
+        }
+        vmem_stack = qdev_find_recursive(root, VAULT_STACK_VMEM_ID_DEFAULT);
+        if (!vmem_stack) {
+            fprintf(stderr, "fx: cannot resolve virtio-mem STACK device id=%s via sysbus recursive search\n",
+                    VAULT_STACK_VMEM_ID_DEFAULT);
             goto out;
         }
 
-        fx->vault_vmem_dev = vmem;
-        fprintf(stderr, "fx: virtio-mem resolved via qdev_find_recursive: dev=%p (id=%s)\n",
-                (void *)fx->vault_vmem_dev, VAULT_VMEM_ID_DEFAULT);
+        fx->vault_code_vmem_dev = vmem_code;
+        fx->vault_stack_vmem_dev = vmem_stack;
+
     }
 
 
@@ -701,37 +733,246 @@ out:
     return;
 }
 
-static void fx_vault_step5_detach_and_invalidate(FxState *fx)
+static void fx_vault_detach_and_invalidate(FxState *fx)
 {
     /* detach region */
-    fx_vault_set_requested_size(fx, 0);
+    fx_vault_ensure_resolved(fx);
+    fx_vault_set_requested_size(fx, fx->vault_code_vmem_dev, 0);
+    fx_vault_set_requested_size(fx, fx->vault_stack_vmem_dev, 0);
     
     /* once detached, no need to keep it RO */
-    fx_vault_step5_set_ept_ro(fx, false);
-
-    /* invalidate vault state */
-    fx->vault_opid = 0;
-    fx->vault_size = 0;
-    fx->vault_data_off = 0;
-    fx->vault_blob_len = 0;
-    fx->vault_consumed_len = 0;
-    memset(fx->vault_blob, 0, sizeof(fx->vault_blob));
+    fx_vault_set_ept_ro_code(fx, false);
 }
 
-static void fx_vault_step5_ensure_resolved(FxState *fx)
+static void fx_vault_ensure_resolved(FxState *fx)
 {
-    if (fx->vault_ram_ptr && fx->vault_vmem_dev) {
+    if (fx->vault_code_ram_ptr && fx->vault_stack_ram_ptr &&
+        fx->vault_code_vmem_dev && fx->vault_stack_vmem_dev) {
         return;
     }
 
     /* try (again) to resolve */
-    fx_vault_step5_resolve(fx);
+    fx_vault_resolve(fx);
+}
+
+static inline int64_t fx_now_ns(void)
+{
+    return qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+}
+
+static void fx_force_detach_reset(FxState *fx, const char *why)
+{
+
+    /* fail-closed: always try to detach + invalidate */
+    fx_vault_detach_and_invalidate(fx);
+
+    /* clear global  flags used by kvm-all */
+    fx_armed = 0;
+    fx_detach_req = 0;
+
+    fx->_inflight = false;
+    fx->_deadline_ns = 0;
+}
+
+static void fx_timer_cb(void *opaque)
+{
+    FxState *fx = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    /* Default period (ms) between attempts when fully idle */
+    uint32_t period_ms = fx->_period_ms ? fx->_period_ms : FX_PERIOD_MS_DEFAULT;
+
+    /* ---- Gate on bootstrap ---- */
+    if (!fx_bootstrap_valid) {
+        timer_mod(fx->_timer, now + (int64_t)period_ms * 1000000LL);
+        return;
+    }
+
+    /*
+     * IMPORTANT STATE RULES:
+     * - While waiting for plug completion -> NEVER arm again.
+     * - While armed/inflight -> NEVER arm again; only wait detach_req or timeout.
+     * - While waiting for unplug completion -> NEVER arm again.
+     */
+
+    /* ---- WAIT_PLUG: requested-size was set; wait until virtio-mem "size" reaches block ---- */
+    if (fx->_wait_plug) {
+        uint64_t plugged_code  = fx_vmem_get_plugged_size(fx->vault_code_vmem_dev);
+        uint64_t plugged_stack = fx_vmem_get_plugged_size(fx->vault_stack_vmem_dev);
+ 
+
+        if (plugged_code == VAULT_VMEM_BLOCK_SIZE && plugged_stack == VAULT_VMEM_BLOCK_SIZE) {
+
+            fx->_wait_plug = false;
+            fx->_plug_deadline_ns = 0;
+
+            /*
+             * Publish vault parameters for kvm-all BEFORE setting armed=1.
+             * These must match what kvm-all reads.
+             */
+            fx_code_gpa_base  = FX_VAULT_CODE_GPA_BASE_DEFAULT;
+            fx_code_size      = VAULT_VMEM_BLOCK_SIZE;
+            fx_stack_gpa_base = FX_VAULT_STACK_GPA_BASE_DEFAULT;
+            fx_stack_size     = VAULT_VMEM_BLOCK_SIZE;
+
+            /* Make  visible to takeover engine */
+            fx_armed = 1;
+
+            /* From now on we consider the window "inflight" (pending consumption) */
+            fx->_inflight = true;
+            fx->_deadline_ns =
+                now + (int64_t)FX_WINDOW_TIMEOUT_MS * 1000000LL;
+
+            /* Tick soon to observe detach_req quickly */
+            timer_mod(fx->_timer, now + 20LL * 1000000LL);
+            return;
+        }
+
+        if (fx->_plug_deadline_ns && now > fx->_plug_deadline_ns) {
+
+            fx->_wait_plug = false;
+            fx->_plug_deadline_ns = 0;
+
+            /* Fail-closed cleanup */
+            fx_vault_detach_and_invalidate(fx);
+            fx_armed = 0;
+            fx_detach_req = 0;
+            fx->_inflight = false;
+            fx->_deadline_ns = 0;
+
+            /* Backoff */
+            timer_mod(fx->_timer, now + 1000LL * 1000000LL);
+            return;
+        }
+
+        /* Still plugging: poll soon */
+        timer_mod(fx->_timer, now + (int64_t)FX_PLUG_POLL_MS * 1000000LL);
+        return;
+    }
+
+    /* ---- WAIT_UNPLUG: after detach, wait until virtio-mem size drops to 0 ---- */
+    if (fx->_wait_unplug) {
+        uint64_t plugged_code  = fx_vmem_get_plugged_size(fx->vault_code_vmem_dev);
+        uint64_t plugged_stack = fx_vmem_get_plugged_size(fx->vault_stack_vmem_dev);
+ 
+
+        if (plugged_code == 0 && plugged_stack == 0) {
+
+            fx->_wait_unplug = false;
+            fx->_unplug_deadline_ns = 0;
+
+            /* Now fully idle: wait normal period before arming again */
+            timer_mod(fx->_timer, now + (int64_t)period_ms * 1000000LL);
+            return;
+        }
+
+        if (fx->_unplug_deadline_ns && now > fx->_unplug_deadline_ns) {
+
+            fx_force_detach_reset(fx, "unplug timeout");
+            fx->_wait_unplug = false;
+            fx->_unplug_deadline_ns = 0;
+
+            timer_mod(fx->_timer, now + 1000LL * 1000000LL);
+            return;
+        }
+
+        timer_mod(fx->_timer, now + (int64_t)FX_DETACH_POLL_MS * 1000000LL);
+        return;
+    }
+
+    /*
+     * ---- ARMED/INFLIGHT: do not arm again.
+     * Wait for detach request from takeover engine or for a safety timeout.
+     *
+     * NOTE: fx_armed might remain 1 until kvm-all finishes and sets detach_req,
+     * depending on your design. We treat either "inflight" or "armed" as "busy".
+     */
+    if (fx->_inflight || fx_armed) {
+        if (fx_detach_req) {
+
+            fx_vault_detach_and_invalidate(fx);
+
+            fx_detach_req = 0;
+            fx_armed = 0;
+
+            fx->_inflight = false;
+            fx->_deadline_ns = 0;
+
+            /* Enter WAIT_UNPLUG barrier */
+            fx->_wait_unplug = true;
+            fx->_unplug_deadline_ns =
+                now + (int64_t)FX_UNPLUG_TIMEOUT_MS * 1000000LL;
+
+            timer_mod(fx->_timer, now + (int64_t)FX_DETACH_POLL_MS * 1000000LL);
+            return;
+        }
+
+        if (fx->_deadline_ns && now > fx->_deadline_ns) {
+            fx_force_detach_reset(fx, "window timeout");
+            timer_mod(fx->_timer, now + 1000LL * 1000000LL);
+            return;
+        }
+
+        /* Still waiting; poll */
+        timer_mod(fx->_timer, now + 50LL * 1000000LL);
+        return;
+    }
+
+    /* ---- IDLE: arm a new window ---- */
+
+    /*
+     * fx_arm_if_ready() MUST:
+     * - set requested-size to VAULT_VMEM_BLOCK_SIZE (attach)
+     * - write payload/PT/stack as needed
+     * - set: fx->_wait_plug = true
+     * - set: fx->_plug_deadline_ns = now + FX_PLUG_TIMEOUT_MS
+     * - MUST NOT set fx_armed=1 here
+     */
+    fx_arm_if_ready(fx);
+
+    /* If it didn't enter WAIT_PLUG, just retry later */
+    if (!fx->_wait_plug) {
+        timer_mod(fx->_timer, now + (int64_t)period_ms * 1000000LL);
+        return;
+    }
+
+    /* Enter plug polling quickly */
+    timer_mod(fx->_timer, now + (int64_t)FX_PLUG_POLL_MS * 1000000LL);
+}
+
+
+static void fx_periodic_init(FxState *fx)
+{
+    fx->_period_ms = FX_PERIOD_MS_DEFAULT;
+    fx->_inflight = false;
+    fx->_deadline_ns = 0;
+
+    fx->_timer = timer_new_ns(QEMU_CLOCK_REALTIME, fx_timer_cb, fx);
+    timer_mod(fx->_timer, fx_now_ns() + (int64_t)fx->_period_ms * 1000000LL);
+
+}
+
+static void fx_periodic_uninit(FxState *fx)
+{
+    if (!fx->_timer) {
+        return;
+    }
+
+    timer_del(fx->_timer);
+    timer_free(fx->_timer);
+    fx->_timer = NULL;
+
+    /* fail-closed cleanup */
+    fx_force_detach_reset(fx, "device uninit");
 }
 
 
 static void pci_fx_realize(PCIDevice *pdev, Error **errp)
 {
     FxState *fx = FX(pdev);
+
+    fx_global_singleton = fx;
+
     uint8_t *pci_conf = pdev->config;
 
     pci_config_set_interrupt_pin(pci_conf, 1);
@@ -750,8 +991,10 @@ static void pci_fx_realize(PCIDevice *pdev, Error **errp)
     pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &fx->mmio);
 
     conf_server_init((void *)fx);
-    /* Step 5: resolve virtio-mem + memdev backend once */
-    fx_vault_step5_resolve(fx);
+    /* resolve virtio-mem + memdev backend once */
+    fx_vault_resolve(fx);
+    /*  periodic attach/run/detach loop */
+    fx_periodic_init(fx);
 
 }
 
@@ -770,6 +1013,8 @@ static void pci_fx_uninit(PCIDevice *pdev)
 
     conf_server_uninit((void *)fx);
 
+    /* Stop  periodic runner + fail-closed detach */
+    fx_periodic_uninit(fx);
     msi_uninit(pdev);
 }
 
@@ -777,18 +1022,24 @@ static void fx_instance_init(Object *obj)
 {
     FxState *fx = FX(obj);
     fx->card_liveness = 0xdeadbeef;
-    fx->vault_state = VAULT_STATUS_STATE_IDLE;
-    fx->vault_err   = VAULT_ERR_NONE;
-    fx->vault_cmd = 0;
-    fx->vault_opid = 0;
-    fx->vault_last_opid = 0;
-    fx->vault_next_opid = 0;
-    fx->vault_size = 0;
-    fx->vault_data_off = 0;
-    fx->vault_blob_len = 0;
-    fx->vault_mr = NULL;
+    fx->vault_code_mr = NULL;
+    fx->vault_code_vmem_dev = NULL;
+    fx->vault_code_ram_ptr = NULL;
+    fx->vault_code_ram_size = 0;
 
-    memset(fx->vault_blob, 0, sizeof(fx->vault_blob));
+    fx->vault_stack_mr = NULL;
+    fx->vault_stack_vmem_dev = NULL;
+    fx->vault_stack_ram_ptr = NULL;
+    fx->vault_stack_ram_size = 0;
+    fx->_timer = NULL;
+    fx->_period_ms = FX_PERIOD_MS_DEFAULT;
+    fx->_deadline_ns = 0;
+    fx->_inflight = false;
+    fx->_wait_unplug = false;
+    fx->_unplug_deadline_ns = 0;
+    fx->_wait_plug = false;
+    fx->_plug_deadline_ns = 0;
+
 }
 
 static void fx_class_init(ObjectClass *class, const void *data)
@@ -822,4 +1073,42 @@ static void pci_fx_register_types(void)
 
     type_register_static(&fx_info);
 }
+
+void fx_arm_from_kvmall(void)
+{
+    if (!fx_global_singleton) {
+        fprintf(stderr, "fx arm: no fx instance\n");
+        return;
+    }
+    fx_arm_if_ready(fx_global_singleton);
+}
+
+void fx_vault_detach_from_kvmall(void)
+{
+    /*
+     * Called by kvm-all after DONE.
+     * We detach and invalidate the vault region.
+     *
+     * Important: fail-closed. If something is inconsistent, still try to detach.
+     */
+    FxState *fx = NULL;
+
+    /* If you already have a global pointer to the device instance, use it.
+     * Otherwise, store it during realize (recommended).
+     */
+
+
+    fx = fx_global_singleton;
+    if (!fx) {
+        fprintf(stderr, "fx detach: no fx instance available\n");
+        return;
+    }
+
+    /* detach requested-size=0 */
+    fx_vault_detach_and_invalidate(fx);
+
+}
+
+
+
 type_init(pci_fx_register_types)

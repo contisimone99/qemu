@@ -82,7 +82,7 @@
 
 #define CUSTOM_DEBUG
 
-#ifdef CUSTOM_DEBUG
+#ifdef CUSTOM_DEBUG 
 #define DBG(fmt, ...) \
     do { fprintf(stderr, fmt, ## __VA_ARGS__); } while (0)
 #else
@@ -2106,7 +2106,6 @@ int kvm_set_irq(KVMState *s, int irq, int level)
         clock_gettime(CLOCK_REALTIME, &begin);
     }
 
-    channel_state = OPENED;
     ret = kvm_vm_ioctl(s, s->irq_set_ioctl, &event);
     if (ret < 0) {
         perror("kvm_set_irq");
@@ -3158,56 +3157,6 @@ static bool within(hwaddr target, hwaddr addr1, hwaddr addr2)
     return false;
 }
 
-
-static KVMSlot *find_slot_containing(hwaddr gpa, KVMState *s)
-{
-    KVMMemoryListener *kml = &s->memory_listener;
-    KVMSlot *slot = NULL;
-    int i;
-
-    kvm_slots_lock();
-    for (i = 0; i < kml->nr_slots_allocated; i++) {
-        KVMSlot *mem = &kml->slots[i];
-
-        if (!mem->memory_size) {
-            continue;
-        }
-
-        if (gpa >= mem->start_addr &&
-            gpa < mem->start_addr + mem->memory_size) {
-            slot = mem;
-            break;
-        }
-    }
-    kvm_slots_unlock();
-    return slot;
-}
-
-/* Called with KVMMemoryListener.slots_lock held */
-static void kvm_free_slot(KVMSlot *slot)
-{
-    struct kvm_userspace_memory_region mem;
-    mem.slot = slot->slot;
-    mem.flags = slot->flags;
-    mem.guest_phys_addr = slot->start_addr;
-    mem.memory_size = 0; /* Slots can be deleted by setting 0 as memory size */
-    mem.userspace_addr = (__u64)slot->ram;
-    slot->memory_size = 0; /* This way, it can be alloc'ed again */
-    kvm_vm_ioctl(kvm_state, KVM_SET_USER_MEMORY_REGION, &mem);
-}
-
-static void kvm_set_slot(KVMSlot *slot)
-{
-    struct kvm_userspace_memory_region mem;
-    mem.slot = slot->slot;
-    mem.flags = slot->flags;
-    mem.guest_phys_addr = slot->start_addr;
-    mem.memory_size = slot->memory_size; 
-    mem.userspace_addr = (__u64)slot->ram;
-    slot->memory_size = slot->memory_size; 
-    kvm_vm_ioctl(kvm_state, KVM_SET_USER_MEMORY_REGION, &mem);
-}
-
 static hwaddr kvm_translate(CPUState *cpu, unsigned long long gva)
 {
     struct kvm_translation translation;
@@ -3217,26 +3166,6 @@ static hwaddr kvm_translate(CPUState *cpu, unsigned long long gva)
     return (hwaddr)translation.physical_address;
 }
 
-static void add_protected_memory_chunk(hwaddr gpa, 
-                                        hwaddr size, 
-                                        KVMSlot *slot,
-                                        const char *name)
-{
-    ProtectedMemoryChunk *pmc = 
-        g_malloc0(sizeof(ProtectedMemoryChunk));
-    pmc->slot = slot;
-    pmc->addr = gpa;
-    pmc->size = size;
-    pmc->name = name;
-    if(pmc_head == NULL){
-        pmc_head = pmc;
-        pmc->next = NULL;
-    }
-    else {
-        pmc->next = pmc_head;
-        pmc_head = pmc;
-    }
-}
 
 static void print_protected_memory_chunk(void)
 {
@@ -3268,33 +3197,7 @@ static int check_within_pmc(hwaddr target)
     return NOT_IN_SLOT;
 }
 
-static void add_saved_memory_chunk(void *hva, 
-                                        hwaddr size, 
-                                        bool automatic_injection,
-                                        bool access_log)
-{
-    SavedMemoryChunk *smc = 
-        g_malloc0(sizeof(SavedMemoryChunk));
 
-    smc->inject_before_interrupt = automatic_injection;
-    smc->access_log = access_log;
-    smc->hva = hva;
-    smc->size = size;
-    smc->saved = g_malloc0(size);
-    if(!smc->saved){
-        DBG("Cannot allocate memory in add_saved_memory_chunk\n");
-        abort();
-    }
-    memcpy(smc->saved, hva, size);
-    if(smc_head == NULL){
-        smc_head = smc;
-        smc->next = NULL;
-    }
-    else {
-        smc->next = smc_head;
-        smc_head = smc;
-    }
-}
 
 /*
 *   reload saved memory chunks marked with 
@@ -3312,235 +3215,597 @@ static void reload_saved_memory_chunks(void)
 }
 
 
-static void print_saved_memory_chunk(void)
+
+/* Initialize mutex/cond once */
+static void fx_init_sync_once(void)
 {
-    return;
-    /*
-    SavedMemoryChunk *smc = smc_head;
-    while(smc != NULL){
-        DBG("Saved memory chunk: addr=%p size=0x%lx\n", smc->hva, smc->size);
-        smc = smc->next;
-    }*/
-}
-
-static SavedMemoryChunk *find_saved_memory_chunk(void *hva,
-                                                            hwaddr size)
-
-{       
-    SavedMemoryChunk *smc = smc_head;
-    while(smc != NULL){
-        if(hva == smc->hva && size == smc->size)
-            return smc;
-        smc = smc->next;
+    static int inited = 0;
+    if (!inited) {
+        qemu_mutex_init(&fx_pause_mtx);
+        qemu_cond_init(&fx_pause_cv);
+        inited = 1;
     }
-    return NULL;
+}
+static void fx_save_msrs(CPUState *cpu)
+{
+    static const uint32_t idx[FX_NMSRS] = {
+        MSR_IA32_FS_BASE,
+        MSR_IA32_GS_BASE,
+        MSR_IA32_KERNEL_GS_BASE,
+        MSR_TSC_AUX,
+        MSR_STAR,
+        MSR_LSTAR,
+        MSR_CSTAR,
+        MSR_SYSCALL_MASK,
+        MSR_IA32_SYSENTER_CS,
+        MSR_IA32_SYSENTER_ESP,
+        MSR_IA32_SYSENTER_EIP,
+    };
+
+    struct {
+        struct kvm_msrs hdr;
+        struct kvm_msr_entry ent[FX_NMSRS];
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.hdr.nmsrs = FX_NMSRS;
+
+    for (uint32_t i = 0; i < FX_NMSRS; i++) {
+        req.ent[i].index = idx[i];
+    }
+
+    int ret = kvm_vcpu_ioctl(cpu, KVM_GET_MSRS, &req);
+    if (ret < 0) {
+        fx_saved.have_msrs = 0;
+        fx_saved.msrs_n = 0;
+        return;
+    }
+
+    fx_saved.have_msrs = 1;
+    fx_saved.msrs_n = FX_NMSRS;
+    memcpy(fx_saved.msrs_entries, req.ent, sizeof(req.ent));
+
+
 }
 
-/* Ensure to pass aligned addresses */
-static KVMSlot *make_read_only_memory_slot(hwaddr gpa, 
-                                        void *hva, 
-                                        KVMSlot *current_slot, 
-                                        unsigned long pages)
+static void fx_restore_msrs(CPUState *cpu)
 {
-    KVMState *s = kvm_state;
-    KVMMemoryListener *kml = &s->memory_listener;
-    KVMSlot *new_slots[3]; /* pre slot | protected slot | post slot */
-    int i;
-    uint64_t total_size;
+    if (!fx_saved.have_msrs || fx_saved.msrs_n != FX_NMSRS) {
+        return;
+    }
 
-    kvm_slots_lock();
+    struct {
+        struct kvm_msrs hdr;
+        struct kvm_msr_entry ent[FX_NMSRS];
+    } req;
 
-    total_size = current_slot->memory_size;
-    kvm_free_slot(current_slot);
+    memset(&req, 0, sizeof(req));
+    req.hdr.nmsrs = FX_NMSRS;
+    memcpy(req.ent, fx_saved.msrs_entries, sizeof(req.ent));
 
-    /* Split current slot */
-    for (i = 0; i < 3; i++){
-        new_slots[i] = kvm_alloc_slot(kml);
-        switch(i){
-        case 0:
-            new_slots[i]->ram = current_slot->ram;
-            new_slots[i]->start_addr = current_slot->start_addr;
-            new_slots[i]->memory_size = gpa - new_slots[0]->start_addr;
-            break;
-        case 1: /* protected slot case */
-            new_slots[i]->ram = hva;
-            new_slots[i]->start_addr = gpa; 
-            new_slots[i]->memory_size = pages * (PAGE_SIZE);  
-            new_slots[i]->flags = KVM_MEM_READONLY;
-            new_slots[i]->old_flags = 0;   
-            break;
-        case 2:
-            new_slots[i]->ram = ((char *)hva + (pages * (PAGE_SIZE)));
-            new_slots[i]->start_addr = gpa + (pages * (PAGE_SIZE));
-            new_slots[i]->memory_size = 
-                total_size - 
-                (new_slots[0]->memory_size + (pages * (PAGE_SIZE)));
-            break;
+    int ret = kvm_vcpu_ioctl(cpu, KVM_SET_MSRS, &req);
+    if (ret < 0) {
+        fprintf(stderr, "[FX]: KVM_SET_MSRS failed (errno=%d)\n", errno);
+        fflush(stderr);
+        return;
+    }
+
+}
+
+/*
+ * ============================================================
+ * FX  physmap execution: clear NX on the direct-map entry
+ * ============================================================
+ *
+ * Kernel direct map is typically NX (ret2dir mitigation). When we set RIP into
+ * physmap (page_offset + GPA), the guest will fault on instruction fetch unless
+ * we temporarily clear NX on the mapping entry covering that VA.
+ *
+ * We do NOT switch CR3 and we do NOT build custom page tables:
+ * we patch the guest's own page tables (one entry) and restore it on exit.
+ */
+
+#ifndef FX_X86_PTE_PRESENT
+#define FX_X86_PTE_PRESENT   (1ULL << 0)
+#endif
+#ifndef FX_X86_PTE_PS
+#define FX_X86_PTE_PS        (1ULL << 7)
+#endif
+#ifndef FX_X86_PTE_NX
+#define FX_X86_PTE_NX        (1ULL << 63)
+#endif
+#ifndef FX_X86_ADDR_MASK
+#define FX_X86_ADDR_MASK     0x000ffffffffff000ULL
+#endif
+
+static inline bool fx_guest_read_u64(uint64_t gpa, uint64_t *out)
+{
+    void *hva = kvm_physical_memory_addr_to_host(kvm_state, (hwaddr)gpa);
+    if (!hva) {
+        return false;
+    }
+    *out = *(uint64_t *)hva;
+    return true;
+}
+
+static inline bool fx_guest_write_u64(uint64_t gpa, uint64_t val)
+{
+    void *hva = kvm_physical_memory_addr_to_host(kvm_state, (hwaddr)gpa);
+    if (!hva) {
+        return false;
+    }
+    *(uint64_t *)hva = val;
+    return true;
+}
+
+static bool fx_find_leaf_entry(uint64_t cr3, uint64_t va, bool la57,
+                                     uint64_t *out_entry_gpa,
+                                     uint64_t *out_entry_val,
+                                     const char **out_level)
+{
+    uint64_t table = cr3 & ~0xfffULL;
+    uint64_t e, entry_gpa;
+
+    /* indices */
+    uint64_t idx_pml5 = (va >> 48) & 0x1ff;
+    uint64_t idx_pml4 = (va >> 39) & 0x1ff;
+    uint64_t idx_pdpt = (va >> 30) & 0x1ff;
+    uint64_t idx_pd   = (va >> 21) & 0x1ff;
+    uint64_t idx_pt   = (va >> 12) & 0x1ff;
+
+    if (la57) {
+        entry_gpa = table + idx_pml5 * 8;
+        if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
+            return false;
         }
-        kvm_set_slot(new_slots[i]);
+        table = e & FX_X86_ADDR_MASK; /* -> PML4 */
     }
 
-    assert(total_size == 
-        new_slots[0]->memory_size + 
-        new_slots[1]->memory_size + 
-        new_slots[2]->memory_size
-    );
+    /* PML4E */
+    entry_gpa = table + idx_pml4 * 8;
+    if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
+        return false;
+    }
+    table = e & FX_X86_ADDR_MASK; /* -> PDPT */
 
-    kvm_slots_unlock();
-    return new_slots[1];
+    /* PDPTE */
+    entry_gpa = table + idx_pdpt * 8;
+    if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
+        return false;
+    }
+    if (e & FX_X86_PTE_PS) {
+        /* 1GB huge page leaf */
+        *out_entry_gpa = entry_gpa;
+        *out_entry_val = e;
+        if (out_level) {
+            *out_level = "PDPTE(1G)";
+        }
+        return true;
+    }
+    table = e & FX_X86_ADDR_MASK; /* -> PD */
+
+    /* PDE / PMD */
+    entry_gpa = table + idx_pd * 8;
+    if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
+        return false;
+    }
+    if (e & FX_X86_PTE_PS) {
+        /* 2MB huge page leaf */
+        *out_entry_gpa = entry_gpa;
+        *out_entry_val = e;
+        if (out_level) {
+            *out_level = "PDE(2M)";
+        }
+        return true;
+    }
+    table = e & FX_X86_ADDR_MASK; /* -> PT */
+
+    /* PTE */
+    entry_gpa = table + idx_pt * 8;
+    if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
+        return false;
+    }
+    *out_entry_gpa = entry_gpa;
+    *out_entry_val = e;
+    if (out_level) {
+        *out_level = "PTE(4K)";
+    }
+    return true;
+}
+
+static bool fx_clear_nx_for_va(uint64_t cr3, uint64_t va, bool la57,
+                                     FxSaved *saved)
+{
+    uint64_t entry_gpa = 0, oldv = 0;
+    const char *lvl = NULL;
+
+    saved->nx_patched = 0;
+    saved->nx_entry_gpa = 0;
+    saved->nx_entry_old = 0;
+
+    if (!fx_find_leaf_entry(cr3, va, la57, &entry_gpa, &oldv, &lvl)) {
+        fprintf(stderr, "[FX]: NX patch: page-walk failed for VA=0x%llx (la57=%d)\n",
+                (unsigned long long)va, (int)la57);
+        fflush(stderr);
+        return false;
+    }
+
+    saved->nx_entry_gpa = entry_gpa;
+    saved->nx_entry_old = oldv;
+
+    if (!(oldv & FX_X86_PTE_NX)) {
+        fprintf(stderr, "[FX]: NX patch: entry already executable (%s) VA=0x%llx entry_gpa=0x%llx\n",
+                lvl ? lvl : "leaf",
+                (unsigned long long)va,
+                (unsigned long long)entry_gpa);
+        fflush(stderr);
+        return true;
+    }
+
+    uint64_t newv = oldv & ~FX_X86_PTE_NX;
+    if (!fx_guest_write_u64(entry_gpa, newv)) {
+        fprintf(stderr, "[FX]: NX patch: write failed entry_gpa=0x%llx\n",
+                (unsigned long long)entry_gpa);
+        fflush(stderr);
+        return false;
+    }
+
+    saved->nx_patched = 1;
+
+    return true;
+}
+
+static void fx_restore_nx(FxSaved *saved)
+{
+    if (!saved->nx_patched) {
+        return;
+    }
+    if (saved->nx_entry_gpa == 0) {
+        return;
+    }
+    (void)fx_guest_write_u64(saved->nx_entry_gpa, saved->nx_entry_old);
+
+    saved->nx_patched = 0;
 }
 
 
-static void do_protect_memory_hypercall(CPUState *cpu, struct kvm_regs *regs)
+static int fx_cap_xsave(void)
 {
-    KVMState *s = kvm_state;
-    KVMSlot *current_slot;
-    hwaddr gpa; 
-    void *hva, *gva; 
-    unsigned int size;
-    char *oldhva, *newhva;
-    int offset;
-
-    gva = (void *)regs->r8;
-    gpa = kvm_translate(cpu, (unsigned long)gva);
-    size = (unsigned int)regs->r9;
-    current_slot = find_slot_containing(gpa, s);
-    hva = kvm_physical_memory_addr_to_host(s, gpa);
-
-    //DBG("\n\ndo_protect_memory_hypercall on %p and size %x\n\n", gva, size);
-    /* Aligning */
-    oldhva = (char *)hva;
-    hva = (void *)((unsigned long)hva & ~(PAGE_SIZE - 1));
-    newhva = (char *)hva;
-    offset = oldhva - newhva;
-
-    current_slot = make_read_only_memory_slot(gpa - offset, 
-                                hva, 
-                                current_slot, 
-                                1);
-    add_protected_memory_chunk(gpa, 
-                                (hwaddr) size, 
-                                current_slot,
-                                "generic protect_memory_hypercall");
+#ifdef KVM_CAP_XSAVE
+    return kvm_check_extension(kvm_state, KVM_CAP_XSAVE) > 0;
+#else
+    return 0;
+#endif
 }
 
-static void do_save_memory_hypercall(CPUState *cpu, struct kvm_regs *regs)
+static int fx_cap_xcrs(void)
 {
-    KVMState *s = kvm_state;
-    void *hva;
-    unsigned int size;
-    bool automatic_injection;
-
-    //DBG("do_save_memory_hypercall\n");
-    hva = kvm_physical_memory_addr_to_host(s, kvm_translate(cpu, regs->r8));
-    size = (unsigned int)regs->r9;
-    automatic_injection = (regs->r12 != 0) ? true : false;
-    //DBG("addr: %p, size %x\n", (void *)regs->r8, size);
-    //DBG("Automatic injection: %d\n", (automatic_injection ? 1:0));
-    add_saved_memory_chunk(hva, size, automatic_injection, false); 
+#ifdef KVM_CAP_XCRS
+    return kvm_check_extension(kvm_state, KVM_CAP_XCRS) > 0;
+#else
+    return 0;
+#endif
 }
 
-static int do_compare_memory_hypercall(CPUState *cpu, struct kvm_regs *regs)
-{
-    KVMState *s = kvm_state;
-    SavedMemoryChunk *smc;
-    void *hva;
-    unsigned int size;
 
-    hva = kvm_physical_memory_addr_to_host(s, kvm_translate(cpu, regs->r8));
-    size = (unsigned int)regs->r9;
-    smc = find_saved_memory_chunk(hva, size);
-    if(smc == NULL)
-        return -1;
-    if(!memcmp(hva, smc->saved, size)){
-        DBG("Comparison OK\n");
+
+
+/* Non-target vCPUs will block inside kvm_cpu_exec when pause is on */
+static void fx_pause_others(CPUState *target)
+{
+    CPUState *c;
+    int total, need;
+
+    fx_init_sync_once();
+
+    qemu_mutex_lock(&fx_pause_mtx);
+    fx_target_cpu = target;
+    fx_paused_count = 0;
+    fx_pause_on = 1;
+
+    /* Kick others so they exit KVM_RUN quickly and see the pause flag */
+    CPU_FOREACH(c) {
+        if (c != target) {
+            /*
+            * Force other vCPUs to leave KVM_RUN quickly so they can reach the
+            * parking point in kvm_cpu_exec.
+            */
+            qatomic_set(&c->exit_request, 1);
+            cpu_exit(c);
+
+            if (kvm_immediate_exit) {
+                kvm_cpu_kick(c);      /* sets kvm_run->immediate_exit = 1 */
+            } else {
+                qemu_cpu_kick(c);     /* fallback if KVM_CAP_IMMEDIATE_EXIT not available */
+            }
+        }
+    }
+        total = 0;
+        CPU_FOREACH(c) {
+            if (c != target) {
+                /* count only CPUs that exist and are not explicitly stopped */
+                if (!c->stopped) {
+                    total++;
+                }
+            }
+        }
+        need = total;
+
+    /* Wait until all other vCPUs are parked */
+    while (fx_paused_count < need) {
+
+        qemu_cond_wait(&fx_pause_cv, &fx_pause_mtx);
+    }
+
+    qemu_mutex_unlock(&fx_pause_mtx);
+}
+
+static void fx_resume_others(void)
+{
+    fx_init_sync_once();
+
+    qemu_mutex_lock(&fx_pause_mtx);
+    fx_pause_on = 0;
+    fx_target_cpu = NULL;
+    qemu_cond_broadcast(&fx_pause_cv);
+    qemu_mutex_unlock(&fx_pause_mtx);
+}
+
+static bool fx_is_cpl0(CPUState *cpu, uint8_t *out_cpl)
+{
+#if defined(TARGET_X86_64) || defined(TARGET_I386)
+    struct kvm_sregs sregs;
+    memset(&sregs, 0, sizeof(sregs));
+    if (kvm_vcpu_ioctl(cpu, KVM_GET_SREGS, &sregs) < 0) {
+        fprintf(stderr, "[FX]: KVM_GET_SREGS failed while checking CPL (errno=%d)\n", errno);
+        fflush(stderr);
+        return false;
+    }
+    uint8_t cpl = (uint8_t)(sregs.cs.selector & 0x3);
+    if (out_cpl) {
+        *out_cpl = cpl;
+    }
+    return cpl == 0;
+#else
+    /* Non-x86 targets: CPL concept does not apply. Treat as allowed. */
+    if (out_cpl) {
+        *out_cpl = 0;
+    }
+    return true;
+#endif
+}
+
+
+
+
+/* Start takeover on the current vCPU (target) */
+static int fx_start_takeover(CPUState *cpu)
+{
+    struct kvm_regs  regs;
+    struct kvm_sregs sregs;
+    struct kvm_fpu   fpu;
+    uint64_t code_va_base;
+    uint64_t stack_va_base;
+
+
+
+
+    /* Vault parameters must be set */
+    if (fx_code_gpa_base == 0 || fx_stack_gpa_base == 0) {
+        fprintf(stderr, "[FX]: invalid vault params (code_gpa=0x%llx code_size=0x%llx stack_gpa=0x%llx stack_size=0x%llx)\n",
+                (unsigned long long)fx_code_gpa_base,
+                (unsigned long long)fx_code_size,
+                (unsigned long long)fx_stack_gpa_base,
+                (unsigned long long)fx_stack_size);
+        fflush(stderr);
+        fx_armed = 0;
         return 0;
     }
-    else {
-        DBG("Comparison NOT OK\n");
-        return 1;
+
+       /*
+     * execute from the kernel direct map (physmap) without
+     * switching CR3 and without building custom page tables.
+     *
+     * VA = physmap_base + PA (guest-physical == GPA in this context).
+     */
+    if (!fx_bootstrap_valid) {
+        fprintf(stderr, "[FX]: bootstrap not valid, refusing takeover\n");
+         fflush(stderr);
+         fx_armed = 0;
+         return 0;
+     }
+ 
+    if (fx_bootstrap_info.page_offset == 0) {
+        fprintf(stderr, "[FX]: physmap base (page_offset) missing/zero\n");
+        fflush(stderr);
+        fx_armed = 0;
+        return 0;
     }
-}
 
-static void do_start_monitor_hypercall(CPUState *cpu)
-{
-    struct kvm_sregs sregs;
+    /* Ensure CODE and STACK vaults are large enough for the layout. */
+    if (fx_code_size < 0x1000) {
+        fprintf(stderr, "[FX]: code vault too small (size=0x%llx)\n",
+                (unsigned long long)fx_code_size);
+        fflush(stderr);
+        fx_armed = 0;
+        return 0;
+    }
+    if (fx_stack_size < FX_STACK_TOP_OFF) {
+        fprintf(stderr, "[FX]: stack vault too small (size=0x%llx need>=0x%llx)\n",
+                (unsigned long long)fx_stack_size,
+                (unsigned long long)FX_STACK_TOP_OFF);
+        fflush(stderr);
+        fx_armed = 0;
+        return 0;
+    }
 
+    /* Stop-the-world (other vCPUs) */
+    fx_pause_others(cpu);
+
+    /* Save full state */
+    memset(&regs, 0, sizeof(regs));
     memset(&sregs, 0, sizeof(sregs));
+    memset(&fpu, 0, sizeof(fpu));
+
+    kvm_vcpu_ioctl(cpu, KVM_GET_REGS,  &regs);
     kvm_vcpu_ioctl(cpu, KVM_GET_SREGS, &sregs);
-    kernel_invariants.gdt_physical_addr = kvm_translate(cpu, sregs.gdt.base);
-    kernel_invariants.idt_physical_addr = kvm_translate(cpu, sregs.idt.base);
-    start_monitor = true;
-}
 
-static void do_end_recording_hypercall(CPUState *cpu)
-{
-    KVMState *s = kvm_state;
-    KVMMemoryListener *kml = &s->memory_listener;
-    struct kvm_access_log al;
-    int i = 0;
-    unsigned int npages;
+    /* NEW: Save MSRs (FS/GS/KERNEL_GS_BASE + syscall/sysenter) */
+    fx_save_msrs(cpu);
 
-    kvm_slots_lock();
-
-    /* iterate all the slots */
-    for (i = 0; i < kml->nr_slots_allocated; i++) {
-        KVMSlot *slot = &kml->slots[i];
-
-        if (slot->memory_size == 0) {
-            continue;
-        }
-        assert((slot->memory_size % PAGE_SIZE) == 0);
-        npages = slot->memory_size / PAGE_SIZE;
-
-        /* prepare KVM_GET_ACCESS_LOG vm ioctl */
-        memset(&al, 0, sizeof(kvm_access_log));
-        al.slot = slot->slot;
-        al.access_bitmap =  g_malloc0(npages); 
-        if(al.access_bitmap == NULL){
-            DBG("cannot allocate memory\n");
-            DBG("Slot number: %d, npages: %u\n", (int)slot->slot, npages);
-            continue;
-        }
-
-        /* get access log */
-        kvm_vm_ioctl(s, KVM_GET_ACCESS_LOG, &al);
-        DBG("Slot %02d,\taccessed pages: %u,\tstarting address: %p\t,size: %lx\t, #pages: %u\n", 
-            (int)slot->slot, 
-            (unsigned int)al.accessed_pages,
-            (void *)slot->start_addr, 
-            slot->memory_size, 
-            npages);
-
-        if(al.accessed_pages == 0)
-            continue;
-
-        /* save accessed pages */
-        //bitmap_iter = (bool *)al.access_bitmap;
-        g_free(al.access_bitmap);
+    /* Save legacy FPU */
+    fx_saved.have_fpu = 0;
+    memset(&fpu, 0, sizeof(fpu));
+    if (kvm_vcpu_ioctl(cpu, KVM_GET_FPU, &fpu) == 0) {
+        fx_saved.fpu = fpu;
+        fx_saved.have_fpu = 1;
     }
 
-    kvm_slots_unlock();
-
-}
-
-static void *pt_monitor_body(void *opaque){
-    while(1){
-        //DBG("prova\n");
-        g_usleep(5 * G_USEC_PER_SEC);
+    /* Save XCRS if available */
+    fx_saved.have_xcrs = 0;
+#ifdef KVM_GET_XCRS
+    if (fx_cap_xcrs()) {
+        memset(&fx_saved.xcrs, 0, sizeof(fx_saved.xcrs));
+        if (kvm_vcpu_ioctl(cpu, KVM_GET_XCRS, &fx_saved.xcrs) == 0) {
+            fx_saved.have_xcrs = 1;
+        }
     }
-    return NULL;
+#endif
+
+    /* Save XSAVE (older fixed-size API) if available */
+    fx_saved.have_xsave = 0;
+#ifdef KVM_GET_XSAVE
+    if (fx_cap_xsave()) {
+        memset(&fx_saved.xsave, 0, sizeof(fx_saved.xsave));
+        if (kvm_vcpu_ioctl(cpu, KVM_GET_XSAVE, &fx_saved.xsave) == 0) {
+            fx_saved.have_xsave = 1;
+        }
+    }
+#endif
+
+    fx_saved.regs  = regs;
+    fx_saved.sregs = sregs;
+    fx_saved.valid = 1;
+
+   
+    /*
+     * Physmap execution requires temporarily clearing NX on the leaf mapping
+     * that covers the vault VA (direct map is typically NX).
+     *
+     * NOTE: We patch the guest page tables (single entry) and restore on exit.
+     */
+    if (!fx_bootstrap_valid || fx_bootstrap_info.page_offset == 0) {
+        fprintf(stderr, "[FX]: NX patch: missing bootstrap/page_offset, refusing takeover\n");
+        fflush(stderr);
+        fx_resume_others();
+        fx_saved.valid = 0;
+        return 0;
+    }
+
+    /* Compute CODE/STACK VA inside physmap (direct map). */
+    code_va_base  = fx_bootstrap_info.page_offset + fx_code_gpa_base;
+    stack_va_base = fx_bootstrap_info.page_offset + fx_stack_gpa_base;
+
+
+    if (!fx_clear_nx_for_va(fx_saved.sregs.cr3, code_va_base,
+                                  (fx_bootstrap_info.la57 != 0),
+                                  &fx_saved)) {
+        fprintf(stderr, "[FX]: NX patch failed, aborting takeover\n");
+        fflush(stderr);
+        fx_resume_others();
+        fx_saved.valid = 0;
+        return 0;
+    }
+    /* === pass ABI registers to payload === */
+    regs.rdi = fx_bootstrap_info.init_task_addr;
+    regs.rsi = (uint64_t)fx_bootstrap_info.off_tasks;
+    regs.rdx = (uint64_t)fx_bootstrap_info.off_pid;
+    regs.rcx = (uint64_t)fx_bootstrap_info.off_comm;
+    regs.r8  = (uint64_t)fx_bootstrap_info.comm_len;
+
+    /* R9 MUST be a VA that is RW: use STACK vault direct-map VA + outbuf offset */
+    regs.r9  = stack_va_base + FX_OUTBUF_OFF;
+
+    /* magic port in r10w (write full r10 is fine) */
+    regs.r10 = (uint64_t)FX_MAGIC_PORT_DONE;
+
+    /* Set RIP/RSP within the temporary mapping */
+    regs.rip = code_va_base + FX_ENTRY_OFF;
+    regs.rsp = stack_va_base + FX_STACK_TOP_OFF - 0x10;
+
+    /* Disable interrupts during vault CR3 */
+    regs.rflags &= ~X86_EFLAGS_IF;
+    regs.rflags |= 0x2ULL; /* bit 1 must be set */
+
+    kvm_vcpu_ioctl(cpu, KVM_SET_REGS, &regs);
+
+    /* Armed consumed: now we are running */
+    fx_armed = 0;
+    return 1;
 }
 
-static double get_elapsed_time(struct timespec *begin, struct timespec *end)
+static void fx_finish_takeover(CPUState *cpu)
 {
-    long seconds, nanoseconds;
-    double elapsed;
-    seconds = end->tv_sec - begin->tv_sec;
-    nanoseconds = end->tv_nsec - begin->tv_nsec;
-    elapsed = seconds + nanoseconds * 1e-9;
-    return elapsed;
+    if (!fx_saved.valid) {
+        return;
+    }
+
+    /*
+     * Restore NX before resuming guest execution.
+     * This keeps the direct-map NX mitigation intact outside the window.
+     */
+    fx_restore_nx(&fx_saved);
+
+    /*
+     * Restore order:
+     *   SREGS -> MSRS -> REGS -> XCRS -> XSAVE -> FPU
+     *
+     * MSRS must be restored before REGS so Linux per-cpu bases (GS/KGS) are correct
+     * when the kernel resumes.
+     */
+    kvm_vcpu_ioctl(cpu, KVM_SET_SREGS, &fx_saved.sregs);
+
+    /* NEW: restore MSRs */
+    fx_restore_msrs(cpu);
+
+    kvm_vcpu_ioctl(cpu, KVM_SET_REGS,  &fx_saved.regs);
+
+#ifdef KVM_SET_XCRS
+    if (fx_saved.have_xcrs) {
+        (void)kvm_vcpu_ioctl(cpu, KVM_SET_XCRS, &fx_saved.xcrs);
+    }
+#endif
+
+#ifdef KVM_SET_XSAVE
+    if (fx_saved.have_xsave) {
+        (void)kvm_vcpu_ioctl(cpu, KVM_SET_XSAVE, &fx_saved.xsave);
+    } else
+#endif
+    if (fx_saved.have_fpu) {
+        (void)kvm_vcpu_ioctl(cpu, KVM_SET_FPU, &fx_saved.fpu);
+    }
+
+    fx_saved.valid = 0;
+
+    fx_resume_others();
+
+    fx_detach_req = 1;
+
 }
+
+
+
+uint32_t fx_get_comm_len_from_kvmall(void)
+{
+    if (!fx_bootstrap_valid) {
+        return 0;
+    }
+    return fx_bootstrap_info.comm_len;
+}
+
+
+
+
 
 /* function for generic hypercall. It acts as a dispatcher by looking
     at the type of hypercall. It also updates the recording state 
@@ -3551,114 +3816,38 @@ static void execute_hypercall(CPUState *cpu)
     struct kvm_regs regs;
     unsigned int type;
 
-    if(channel_state == CLOSED){
-        DBG("Attempted hypercall with closed channel! \n");
-        return;
-    }
 
     memset(&regs, 0, sizeof(regs));
     kvm_vcpu_ioctl(cpu, KVM_GET_REGS, &regs);
     type = regs.r10;
-
+    
     switch(type){
-    case AGENT_HYPERCALL:
-        break;
-    case PROTECT_MEMORY_HYPERCALL:
-        do_protect_memory_hypercall(cpu, &regs);
-        break;
-    case SAVE_MEMORY_HYPERCALL:
-        do_save_memory_hypercall(cpu, &regs);
-        print_saved_memory_chunk();
-        break;
-    case COMPARE_MEMORY_HYPERCALL:
-        do_compare_memory_hypercall(cpu, &regs);
-        break;
-    case SET_IRQ_LINE_HYPERCALL:
-        fx_irq_line = (int)regs.r8;
-        recording_state = RECORDING;
-        qemu_thread_create(
-            &pt_monitor, 
-            "page table monitor", 
-            pt_monitor_body,
-            NULL, QEMU_THREAD_JOINABLE
+    case BOOTSTRAP_INFO_HYPERCALL: {
+        void *guest_ptr = kvm_physical_memory_addr_to_host(
+            kvm_state,
+            (hwaddr)kvm_translate(cpu, regs.r8)
         );
-        qemu_mutex_init(&pt_mutex);
-        /* save the entire state of guest memory */
-        break;
-    case START_MONITOR_HYPERCALL:
-        do_start_monitor_hypercall(cpu);
-        break;
-    case END_RECORDING_HYPERCALL: {
-        double elapsed;
-        clock_gettime(CLOCK_REALTIME, &end);
-        elapsed = get_elapsed_time(&begin, &end);
-        if(perf_fd)
-            LOG(perf_fd, "Time measured: %.9f seconds.\n", elapsed);
-        if(recording_state == RECORDING){
-            recording_state = POST_RECORDING;
-            do_end_recording_hypercall(cpu);
+
+        if (!guest_ptr) {
+            fprintf(stderr, "[FX] BOOTSTRAP_INFO: guest_ptr NULL\n");
+            fflush(stderr);
+            break;
         }
-        channel_state = CLOSED;
-        break;  
-    } 
-    case SET_PROCESS_LIST_HYPERCALL:
-        process_list = kvm_physical_memory_addr_to_host(
-                            kvm_state,  
-                            (hwaddr)kvm_translate(cpu, regs.r8));
-        DBG("PROCESS LIST: %p\n", process_list);
-        break;
-    case PROCESS_LIST_HYPERCALL:
-        /* to check if everything is good, simply print 
-            the list of processes */
-        //DBG("%s\n", (const char *)process_list);
-        break;
-    case START_TIMER_HYPERCALL:{
-        cpu_set_t mask;
-        CPU_ZERO(&mask);
-        CPU_SET(0, &mask);
-        if (sched_setaffinity(getpid(), sizeof(cpu_set_t), &mask) == -1) {
-            DBG("sched_setaffinity");
-            assert(false);
-        }
-        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &begin_hypercall);
-        break;
-    }
-    case EMPTY_HYPERCALL:
-        break;
-    case STOP_TIMER_HYPERCALL:{
-        double elapsed;
-        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end_hypercall);
-        elapsed = get_elapsed_time(&begin_hypercall, &end_hypercall);
-        if(hypercall_fd == NULL)
-            hypercall_fd = fopen("hypercall_log.txt", "a");
-        LOG(hypercall_fd, "Hypercall time: %.3f microsecs.\n", (elapsed / 100000)*1e6);
+
+        memcpy(&fx_bootstrap_info, guest_ptr, sizeof(fx_bootstrap_info));
+        fx_bootstrap_valid = true;
+
         break;
     }
     default:
-        DBG("Hypercall not recognized\n");
+        fprintf(stderr, "[FX] unknown hypercall type=%u\n", type);
+        fflush(stderr);
         break;
     }
 }
 
 
-static void find_fx_mr(void)
-{
-    MemoryRegion *system;
-    MemoryRegion *i, *j;
-    system = get_system_memory();
-    QTAILQ_FOREACH(i, &system->subregions, subregions_link){
-        if(!strcmp(i->name, "pci")){
-            QTAILQ_FOREACH(j, &i->subregions, subregions_link){
-                if(!strcmp(j->name, "fx-mmio")){
-                    fx_mr = j;
-                    goto exit;
-                }
-            }
-        }
-    }
-    exit:
-    return;
-}
+
 
 /* Monitoring the IDTR and GDTR registers */
 static void check_idtr_gdtr(CPUState *cpu)
@@ -3791,8 +3980,7 @@ int kvm_cpu_exec(CPUState *cpu)
     void *hva;
 
     trace_kvm_cpu_exec();
-    if(fx_mr == NULL)
-        find_fx_mr();
+
 
     if (kvm_arch_process_async_events(cpu)) {
         return EXCP_HLT;
@@ -3803,7 +3991,21 @@ int kvm_cpu_exec(CPUState *cpu)
 
     do {
         MemTxAttrs attrs;
+        /* FX: stop-the-world parking point (non-target vCPUs) */
+        if (fx_pause_on && cpu != fx_target_cpu) {
+            fx_init_sync_once();
 
+            qemu_mutex_lock(&fx_pause_mtx);
+            fx_paused_count++;
+            qemu_cond_broadcast(&fx_pause_cv);
+
+            while (fx_pause_on) {
+                qemu_cond_wait(&fx_pause_cv, &fx_pause_mtx);
+            }
+
+            fx_paused_count--;
+            qemu_mutex_unlock(&fx_pause_mtx);
+        }
         if (cpu->vcpu_dirty) {
             if (!kvm_cpu_synchronize_put(cpu, KVM_PUT_RUNTIME_STATE,
                                          "at runtime")) {
@@ -3826,6 +4028,34 @@ int kvm_cpu_exec(CPUState *cpu)
         if(start_monitor)
             check_idtr_gdtr(cpu);
 
+        /*
+        * FX: start takeover on the first vCPU that observes arming.
+        * Use an atomic claim so only one vCPU can start it.
+        */
+        int claimed = (qatomic_cmpxchg(&fx_armed, 1, 0) == 1);
+        if (claimed) {
+            uint8_t cpl = 0xff;
+            if (!fx_is_cpl0(cpu, &cpl)) {
+                /*
+                 * Not in kernel mode yet: do NOT stop-the-world and do NOT take over.
+                 * Re-arm so we can retry on a future safe point.
+                 */
+                static uint64_t fx_cpl_miss;
+                fx_cpl_miss++;
+                if ((fx_cpl_miss & 0x3ff) == 1) {
+                    fprintf(stderr,
+                            "[FX]: CPL gating blocked takeover on cpu_index=%d (CPL=%u), re-arming\n",
+                            cpu->cpu_index, cpl);
+                    fflush(stderr);
+                }
+                qatomic_set(&fx_armed, 1);
+            } else {
+
+                fx_start_takeover(cpu);
+            }
+        }
+
+        
         run_ret = kvm_vcpu_ioctl(cpu, KVM_RUN, 0);
 
         /*
@@ -3873,6 +4103,21 @@ int kvm_cpu_exec(CPUState *cpu)
         trace_kvm_run_exit(cpu->cpu_index, run->exit_reason);
         switch (run->exit_reason) {
         case KVM_EXIT_IO:
+            /*
+             * FX: completion path:
+             * payload does OUT on FX_MAGIC_PORT_DONE -> we restore state.
+             */
+            if (run->io.direction == KVM_EXIT_IO_OUT &&
+                run->io.port == FX_MAGIC_PORT_DONE &&
+                fx_saved.valid) {
+                /*dump mailbox (STACK vault RW) before restoring/detach */
+                fx_dump_mailbox_from_kvmall();
+                /* Do not forward I/O to normal devices */
+                fx_finish_takeover(cpu);
+
+                ret = 0;
+                break;
+            }
             /* Called outside BQL */
             kvm_handle_io(run->io.port, attrs,
                           (uint8_t *)run + run->io.data_offset,
@@ -3883,9 +4128,23 @@ int kvm_cpu_exec(CPUState *cpu)
             break;
         case KVM_EXIT_MMIO:
             /* Called outside BQL */
-
             /*
-            * 1) learn fx_base using a distinctive access:
+            * 0) Learn fx_base from the hypercall trigger itself:
+            *    hypercall is a qword write at offset 0x80.
+            *    This removes the need for a dummy write at 0x64.
+            */
+            if (!fx_base_known &&
+                run->mmio.is_write &&
+                run->mmio.len == 8 &&
+                ((run->mmio.phys_addr & 0xfffULL) == 0x80)) {
+
+                fx_base = run->mmio.phys_addr - 0x80;
+                fx_base_known = 1;
+                DBG("[fx] learned fx_base via hypercall write: 0x%llx\n",
+                    (unsigned long long)fx_base);
+            }
+            /*
+            * 1) fallback: learn fx_base using a distinctive access:
             *    IRQ ACK is a write at offset 0x64 (4 bytes) of the fx device.
             */
             if (!fx_base_known &&
