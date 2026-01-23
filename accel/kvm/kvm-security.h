@@ -83,10 +83,6 @@ typedef struct FxBootstrapInfo {
 static FxBootstrapInfo fx_bootstrap_info;
 extern bool fx_bootstrap_valid;
 
-/* =========================
- * FX Step 1: Hello monitor
- * takeover + return
- * ========================= */
 
 /* I/O port used by the vault payload to signal completion */
 #define FX_MAGIC_PORT_DONE           0x00F1
@@ -97,20 +93,20 @@ extern bool fx_bootstrap_valid;
  *   stack_va_base = page_offset + stack_gpa_base
  * CR3 is left unchanged (no in-vault page tables).
  */
-#define FX_STEP1_ENTRY_OFF           0x0000ULL
-#define FX_STEP1_STACK_OFF           0x10000ULL   /* stack starts after outbuf */
-#define FX_STEP1_STACK_SIZE          0x10000ULL   /* 64KB stack */
-#define FX_STEP1_STACK_TOP_OFF       (FX_STEP1_STACK_OFF + FX_STEP1_STACK_SIZE)
+#define FX_ENTRY_OFF           0x0000ULL
+#define FX_STACK_OFF           0x10000ULL   /* stack starts after outbuf */
+#define FX_STACK_SIZE          0x10000ULL   /* 64KB stack */
+#define FX_STACK_TOP_OFF       (FX_STACK_OFF + FX_STACK_SIZE)
 
 
-/* === Step 5 mailbox + bigger stack layout (inside STACK vault, RW EPT) === */
-#define FX_STEP1_OUTBUF_OFF          0x0000ULL
-#define FX_STEP1_OUTBUF_SIZE         0x10000ULL   /* 64KB output buffer */
+/* === mailbox + bigger stack layout (inside STACK vault, RW EPT) === */
+#define FX_OUTBUF_OFF          0x0000ULL
+#define FX_OUTBUF_SIZE         0x10000ULL   /* 64KB output buffer */
 
 
 /* Export used by kvm-all.c on DONE to print mailbox */
-void fx_step5_dump_mailbox_from_kvmall(void);
-uint32_t fx_step5_get_comm_len_from_kvmall(void);
+void fx_dump_mailbox_from_kvmall(void);
+uint32_t fx_get_comm_len_from_kvmall(void);
 
 
 #ifndef X86_EFLAGS_IF
@@ -154,7 +150,7 @@ uint32_t fx_step5_get_comm_len_from_kvmall(void);
 #define MSR_IA32_SYSENTER_EIP   0x00000176
 #endif
 
-#define FX_STEP1_NMSRS  11
+#define FX_NMSRS  11
 
 
 /*
@@ -162,23 +158,23 @@ uint32_t fx_step5_get_comm_len_from_kvmall(void);
  * They live in kvm-all so that the vCPU thread can run takeover without
  * additional plumbing.
  */
-uint64_t fx_step1_code_gpa_base  = 0;
-uint64_t fx_step1_code_size      = 0;
-uint64_t fx_step1_stack_gpa_base = 0;
-uint64_t fx_step1_stack_size     = 0;
-volatile int fx_step1_armed      = 0;
+uint64_t fx_code_gpa_base  = 0;
+uint64_t fx_code_size      = 0;
+uint64_t fx_stack_gpa_base = 0;
+uint64_t fx_stack_size     = 0;
+volatile int fx_armed      = 0;
 
 /* Request from KVM side to detach vault after step completion */
-volatile int fx_step1_detach_req = 0;
+volatile int fx_detach_req = 0;
 
 /* Stop-the-world coordination for "stop other vCPUs" */
-static QemuMutex fx_step1_pause_mtx;
-static QemuCond  fx_step1_pause_cv;
-static volatile int fx_step1_pause_on = 0;
-static CPUState *fx_step1_target_cpu  = NULL;
-static int fx_step1_paused_count      = 0;
+static QemuMutex fx_pause_mtx;
+static QemuCond  fx_pause_cv;
+static volatile int fx_pause_on = 0;
+static CPUState *fx_target_cpu  = NULL;
+static int fx_paused_count      = 0;
 
-typedef struct FxStep1Saved {
+typedef struct FxSaved {
     struct kvm_regs  regs;
     struct kvm_sregs sregs;
 
@@ -197,18 +193,18 @@ typedef struct FxStep1Saved {
     int valid;
     int have_msrs;
     uint32_t msrs_n;
-    struct kvm_msr_entry msrs_entries[FX_STEP1_NMSRS];
+    struct kvm_msr_entry msrs_entries[FX_NMSRS];
     int nx_patched;
     uint64_t nx_entry_gpa;
     uint64_t nx_entry_old;
 
-} FxStep1Saved;
+} FxSaved;
 
-static FxStep1Saved fx_step1_saved = {0};
+static FxSaved fx_saved = {0};
 
 /* Forward decl: implemented in fx device (fx.c) */
-void fx_vault_step1_detach_from_kvmall(void);
-extern void fx_step1_arm_from_kvmall(void);
+void fx_vault_detach_from_kvmall(void);
+extern void fx_arm_from_kvmall(void);
 
 
 
