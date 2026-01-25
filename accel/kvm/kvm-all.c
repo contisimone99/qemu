@@ -3615,7 +3615,7 @@ static int fx_start_takeover(CPUState *cpu)
          return 0;
      }
  
-    if (fx_bootstrap_info.page_offset == 0) {
+    if (fx_bootstrap_info.physmap_base_va == 0) {
         fprintf(stderr, "[FX]: physmap base (page_offset) missing/zero\n");
         fflush(stderr);
         fx_armed = 0;
@@ -3694,7 +3694,7 @@ static int fx_start_takeover(CPUState *cpu)
      *
      * NOTE: We patch the guest page tables (single entry) and restore on exit.
      */
-    if (!fx_bootstrap_valid || fx_bootstrap_info.page_offset == 0) {
+    if (!fx_bootstrap_valid || fx_bootstrap_info.physmap_base_va == 0) {
         fprintf(stderr, "[FX]: NX patch: missing bootstrap/page_offset, refusing takeover\n");
         fflush(stderr);
         fx_resume_others();
@@ -3703,8 +3703,8 @@ static int fx_start_takeover(CPUState *cpu)
     }
 
     /* Compute CODE/STACK VA inside physmap (direct map). */
-    code_va_base  = fx_bootstrap_info.page_offset + fx_code_gpa_base;
-    stack_va_base = fx_bootstrap_info.page_offset + fx_stack_gpa_base;
+    code_va_base  = fx_bootstrap_info.physmap_base_va + fx_code_gpa_base;
+    stack_va_base = fx_bootstrap_info.physmap_base_va + fx_stack_gpa_base;
 
 
     if (!fx_clear_nx_for_va(fx_saved.sregs.cr3, code_va_base,
@@ -3835,6 +3835,17 @@ static void execute_hypercall(CPUState *cpu)
         }
 
         memcpy(&fx_bootstrap_info, guest_ptr, sizeof(fx_bootstrap_info));
+        //print fx_bootstrap_info
+        fprintf(stderr, "[FX] BOOTSTRAP_INFO received:\n");
+        fprintf(stderr,
+            "  physmap_base_va: 0x%llx\n  physmap_size: 0x%llx\n kernel_text_va: 0x%llx\n  kernel_end_va: 0x%llx\n  kernel_text_pa: 0x%llx\n  vmalloc_start: 0x%llx\n   vmalloc_end: 0x%llx\n",
+            (unsigned long long)fx_bootstrap_info.physmap_base_va,
+            (unsigned long long)fx_bootstrap_info.physmap_size,
+            (unsigned long long)fx_bootstrap_info.kernel_text_va,
+            (unsigned long long)fx_bootstrap_info.kernel_end_va,
+            (unsigned long long)fx_bootstrap_info.kernel_text_pa,
+            (unsigned long long)fx_bootstrap_info.vmalloc_start,
+            (unsigned long long)fx_bootstrap_info.vmalloc_end);
         fx_bootstrap_valid = true;
 
         break;

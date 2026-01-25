@@ -75,7 +75,20 @@ typedef struct FxBootstrapInfo {
 
     /* sanity / constants */
     uint64_t init_task_pa;
-    uint64_t page_offset;
+    uint64_t physmap_base_va;
+
+    /* guest memory size hint (for mapping physmap fully) */
+    uint64_t physmap_size;        /* max_pfn << PAGE_SHIFT (best effort) */
+
+    /* kernel image mapping (VA->PA without guest page tables) */
+    uint64_t kernel_text_va;      /* _stext VA */
+    uint64_t kernel_text_pa;     // _stext PA (phys_base + offset)
+    uint64_t kernel_end_va;       /* _end VA */
+
+    /* vmalloc area range */
+    uint64_t vmalloc_start;
+    uint64_t vmalloc_end;
+ 
 
     uint32_t task_struct_size;
 } __attribute__((packed)) FxBootstrapInfo;
