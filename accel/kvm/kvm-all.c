@@ -3338,135 +3338,6 @@ static inline bool fx_guest_write_u64(uint64_t gpa, uint64_t val)
     return true;
 }
 
-static bool fx_find_leaf_entry(uint64_t cr3, uint64_t va, bool la57,
-                                     uint64_t *out_entry_gpa,
-                                     uint64_t *out_entry_val,
-                                     const char **out_level)
-{
-    uint64_t table = cr3 & ~0xfffULL;
-    uint64_t e, entry_gpa;
-
-    /* indices */
-    uint64_t idx_pml5 = (va >> 48) & 0x1ff;
-    uint64_t idx_pml4 = (va >> 39) & 0x1ff;
-    uint64_t idx_pdpt = (va >> 30) & 0x1ff;
-    uint64_t idx_pd   = (va >> 21) & 0x1ff;
-    uint64_t idx_pt   = (va >> 12) & 0x1ff;
-
-    if (la57) {
-        entry_gpa = table + idx_pml5 * 8;
-        if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
-            return false;
-        }
-        table = e & FX_X86_ADDR_MASK; /* -> PML4 */
-    }
-
-    /* PML4E */
-    entry_gpa = table + idx_pml4 * 8;
-    if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
-        return false;
-    }
-    table = e & FX_X86_ADDR_MASK; /* -> PDPT */
-
-    /* PDPTE */
-    entry_gpa = table + idx_pdpt * 8;
-    if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
-        return false;
-    }
-    if (e & FX_X86_PTE_PS) {
-        /* 1GB huge page leaf */
-        *out_entry_gpa = entry_gpa;
-        *out_entry_val = e;
-        if (out_level) {
-            *out_level = "PDPTE(1G)";
-        }
-        return true;
-    }
-    table = e & FX_X86_ADDR_MASK; /* -> PD */
-
-    /* PDE / PMD */
-    entry_gpa = table + idx_pd * 8;
-    if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
-        return false;
-    }
-    if (e & FX_X86_PTE_PS) {
-        /* 2MB huge page leaf */
-        *out_entry_gpa = entry_gpa;
-        *out_entry_val = e;
-        if (out_level) {
-            *out_level = "PDE(2M)";
-        }
-        return true;
-    }
-    table = e & FX_X86_ADDR_MASK; /* -> PT */
-
-    /* PTE */
-    entry_gpa = table + idx_pt * 8;
-    if (!fx_guest_read_u64(entry_gpa, &e) || !(e & FX_X86_PTE_PRESENT)) {
-        return false;
-    }
-    *out_entry_gpa = entry_gpa;
-    *out_entry_val = e;
-    if (out_level) {
-        *out_level = "PTE(4K)";
-    }
-    return true;
-}
-
-static bool fx_clear_nx_for_va(uint64_t cr3, uint64_t va, bool la57,
-                                     FxSaved *saved)
-{
-    uint64_t entry_gpa = 0, oldv = 0;
-    const char *lvl = NULL;
-
-    saved->nx_patched = 0;
-    saved->nx_entry_gpa = 0;
-    saved->nx_entry_old = 0;
-
-    if (!fx_find_leaf_entry(cr3, va, la57, &entry_gpa, &oldv, &lvl)) {
-        fprintf(stderr, "[FX]: NX patch: page-walk failed for VA=0x%llx (la57=%d)\n",
-                (unsigned long long)va, (int)la57);
-        fflush(stderr);
-        return false;
-    }
-
-    saved->nx_entry_gpa = entry_gpa;
-    saved->nx_entry_old = oldv;
-
-    if (!(oldv & FX_X86_PTE_NX)) {
-        fprintf(stderr, "[FX]: NX patch: entry already executable (%s) VA=0x%llx entry_gpa=0x%llx\n",
-                lvl ? lvl : "leaf",
-                (unsigned long long)va,
-                (unsigned long long)entry_gpa);
-        fflush(stderr);
-        return true;
-    }
-
-    uint64_t newv = oldv & ~FX_X86_PTE_NX;
-    if (!fx_guest_write_u64(entry_gpa, newv)) {
-        fprintf(stderr, "[FX]: NX patch: write failed entry_gpa=0x%llx\n",
-                (unsigned long long)entry_gpa);
-        fflush(stderr);
-        return false;
-    }
-
-    saved->nx_patched = 1;
-
-    return true;
-}
-
-static void fx_restore_nx(FxSaved *saved)
-{
-    if (!saved->nx_patched) {
-        return;
-    }
-    if (saved->nx_entry_gpa == 0) {
-        return;
-    }
-    (void)fx_guest_write_u64(saved->nx_entry_gpa, saved->nx_entry_old);
-
-    saved->nx_patched = 0;
-}
 
 
 static int fx_cap_xsave(void)
@@ -3575,7 +3446,353 @@ static bool fx_is_cpl0(CPUState *cpu, uint8_t *out_cpl)
 #endif
 }
 
+/*
+ * ============================================================
+ * FX  host-private window (no guest PT usage)
+ * ============================================================
+ *
+ * We allocate a host-private buffer (HVA) and map it into the guest only
+ * during the monitoring window via a temporary KVM memslot.
+ *
+ * Inside that buffer we build hyper-owned shadow page tables and run the
+ * payload with CR3 switched to those PTs. Code/stack/mailbox live entirely
+ * in this private region.
+ */
 
+#define FX_PRIV_GPA_BASE   0x3f00000000ULL
+#define FX_PRIV_SIZE       (4ULL * 1024 * 1024)  /* 4MB total */
+#define FX_PRIV_PT_OFF     0x000000ULL
+#define FX_PRIV_CODE_OFF   0x200000ULL
+#define FX_PRIV_STACK_OFF  0x210000ULL
+#define FX_PRIV_MAIL_OFF   0x220000ULL
+
+#define FX_PRIV_VA_BASE    0xfffffe8000000000ULL
+#define FX_PRIV_VA_CODE    (FX_PRIV_VA_BASE + 0x000000ULL)
+#define FX_PRIV_VA_STACK   (FX_PRIV_VA_BASE + 0x100000ULL)
+#define FX_PRIV_VA_MAIL    (FX_PRIV_VA_BASE + 0x200000ULL)
+
+/* Page-table flags */
+#ifndef FX_PTE_W
+#define FX_PTE_W           (1ULL << 1)
+#endif
+
+typedef struct FxPrivRegion {
+    void    *hva;
+    uint64_t gpa_base;
+    uint64_t size;
+    KVMSlot *slot;        /* reserved slot (kept for lifetime) */
+    bool     mapped;      /* memslot active (EPT visible) */
+    uint64_t pt_next_off; /* bump allocator for PT pages */
+} FxPrivRegion;
+
+static FxPrivRegion fx_priv = {
+    .hva = NULL,
+    .gpa_base = FX_PRIV_GPA_BASE,
+    .size = FX_PRIV_SIZE,
+    .slot = NULL,
+    .mapped = false,
+    .pt_next_off = FX_PRIV_PT_OFF,
+};
+
+static inline uint64_t fx_priv_gpa(uint64_t off)
+{
+    return fx_priv.gpa_base + off;
+}
+static inline void *fx_priv_hva(uint64_t off)
+{
+    return (void *)((uint8_t *)fx_priv.hva + off);
+}
+static inline void fx_priv_reset_allocator(void)
+{
+    fx_priv.pt_next_off = FX_PRIV_PT_OFF;
+}
+
+static bool fx_priv_ensure_alloc(void)
+{
+    if (fx_priv.hva) {
+        return true;
+    }
+
+    if (fx_priv.size == 0 || fx_priv.size > (uint64_t)SIZE_MAX) {
+        fprintf(stderr, "[FX]: invalid private region size=0x%llx\n",
+                (unsigned long long)fx_priv.size);
+        fflush(stderr);
+        return false;
+    }
+
+    size_t sz = (size_t)fx_priv.size;
+
+    void *p = mmap(NULL, sz,
+                   PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS,
+                   -1, 0);
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "[FX]: mmap private region failed (sz=0x%zx errno=%d)\n",
+                sz, errno);
+        fflush(stderr);
+        return false;
+    }
+
+    fx_priv.hva = p;
+    /* mmap is not guaranteed zeroed on all systems? On Linux MAP_ANONYMOUS is zeroed,
+       but keep memset for clarity. */
+    memset(fx_priv.hva, 0, sz);
+    return true;
+}
+
+
+
+/* Exported symbol: device can write payload bytes into the private code page. */
+bool fx_priv_write_payload(const void *buf, size_t len)
+{
+    if (!buf || len == 0) {
+        return false;
+    }
+    if (!fx_priv_ensure_alloc()) {
+        return false;
+    }
+    if (FX_PRIV_CODE_OFF + FX_ENTRY_OFF + len > fx_priv.size) {
+        fprintf(stderr, "[FX]: payload too large for private code page (len=%zu)\n", len);
+        fflush(stderr);
+        return false;
+    }
+    memcpy((uint8_t *)fx_priv_hva(FX_PRIV_CODE_OFF + FX_ENTRY_OFF), buf, len);
+    return true;
+}
+
+/* Exported symbol: returns an HVA inside the private region for device-side init/debug */
+void *fx_priv_get_hva(uint64_t off, uint64_t len)
+{
+    if (!fx_priv_ensure_alloc()) {
+        return NULL;
+    }
+    if (off + len > fx_priv.size) {
+        return NULL;
+    }
+    return fx_priv_hva(off);
+}
+
+/* Reserve a KVM slot once, then toggle mapping by setting memory_size (size or 0). */
+static bool fx_priv_ensure_slot(void)
+{
+    if (fx_priv.slot) {
+        return true;
+    }
+    if (!kvm_state || kvm_state->nr_as <= 0 || !kvm_state->as[0].ml) {
+        fprintf(stderr, "[FX]: cannot allocate private memslot (kvm_state/as not ready)\n");
+        fflush(stderr);
+        return false;
+    }
+    kvm_slots_lock();
+    fx_priv.slot = kvm_alloc_slot(kvm_state->as[0].ml);
+    kvm_slots_unlock();
+    if (!fx_priv.slot) {
+        fprintf(stderr, "[FX]: cannot allocate private memslot (no free slots)\n");
+        fflush(stderr);
+        return false;
+    }
+    return true;
+}
+
+static bool fx_priv_map_enable(void)
+{
+    if (fx_priv.mapped) {
+        return true;
+    }
+    if (!fx_priv_ensure_alloc()) {
+        return false;
+    }
+    if (!fx_priv_ensure_slot()) {
+        return false;
+    }
+
+    fx_priv.slot->start_addr  = fx_priv.gpa_base;
+    fx_priv.slot->memory_size = fx_priv.size;
+    fx_priv.slot->ram         = fx_priv.hva;
+    fx_priv.slot->flags       = 0;
+    fx_priv.slot->guest_memfd = -1;
+    fx_priv.slot->guest_memfd_offset = 0;
+
+    if (kvm_set_user_memory_region(kvm_state->as[0].ml, fx_priv.slot, true) < 0) {
+        fprintf(stderr, "[FX]: failed to enable private memslot\n");
+        fflush(stderr);
+        return false;
+    }
+
+    fx_priv.mapped = true;
+    return true;
+}
+
+static void fx_priv_map_disable(void)
+{
+    if (!fx_priv.mapped || !fx_priv.slot) {
+        return;
+    }
+    fx_priv.slot->memory_size = 0;
+    (void)kvm_set_user_memory_region(kvm_state->as[0].ml, fx_priv.slot, false);
+    fx_priv.mapped = false;
+}
+
+/* Allocate one 4K page from the private region for page-table use. */
+static bool fx_priv_alloc_pt_page(uint64_t *out_gpa)
+{
+    uint64_t off = fx_priv.pt_next_off;
+    if (off + 0x1000 > FX_PRIV_CODE_OFF) {
+        fprintf(stderr, "[FX]: PT pool exhausted (off=0x%llx)\n", (unsigned long long)off);
+        fflush(stderr);
+        return false;
+    }
+    fx_priv.pt_next_off += 0x1000;
+    memset(fx_priv_hva(off), 0, 0x1000);
+    if (out_gpa) *out_gpa = fx_priv_gpa(off);
+    return true;
+}
+
+static inline uint64_t fx_pte_addr(uint64_t pa) { return pa & FX_X86_ADDR_MASK; }
+
+static bool fx_pt_get_next(uint64_t table_gpa, uint16_t idx, bool create, uint64_t flags, uint64_t *next_gpa)
+{
+    uint64_t *pt = (uint64_t *)fx_priv_hva(table_gpa - fx_priv.gpa_base);
+    uint64_t e = pt[idx];
+    if (e & FX_X86_PTE_PRESENT) {
+        *next_gpa = fx_pte_addr(e);
+        return true;
+    }
+    if (!create) {
+        return false;
+    }
+    uint64_t new_gpa = 0;
+    if (!fx_priv_alloc_pt_page(&new_gpa)) {
+        return false;
+    }
+    pt[idx] = (new_gpa & FX_X86_ADDR_MASK) | flags | FX_X86_PTE_PRESENT;
+    *next_gpa = new_gpa;
+    return true;
+}
+
+static bool fx_shadow_map_4k(uint64_t root_gpa, bool la57, uint64_t va, uint64_t pa, uint64_t leaf_flags)
+{
+    uint16_t i5 = (va >> 48) & 0x1ff;
+    uint16_t i4 = (va >> 39) & 0x1ff;
+    uint16_t i3 = (va >> 30) & 0x1ff;
+    uint16_t i2 = (va >> 21) & 0x1ff;
+    uint16_t i1 = (va >> 12) & 0x1ff;
+
+    uint64_t pml4_gpa = root_gpa;
+    if (la57) {
+        uint64_t tmp;
+        if (!fx_pt_get_next(root_gpa, i5, true, FX_PTE_W, &tmp)) return false;
+        pml4_gpa = tmp;
+    }
+
+    uint64_t pdpt_gpa, pd_gpa, pt_gpa;
+    if (!fx_pt_get_next(pml4_gpa, i4, true, FX_PTE_W, &pdpt_gpa)) return false;
+    if (!fx_pt_get_next(pdpt_gpa, i3, true, FX_PTE_W, &pd_gpa)) return false;
+    if (!fx_pt_get_next(pd_gpa, i2, true, FX_PTE_W, &pt_gpa)) return false;
+
+    uint64_t *pt = (uint64_t *)fx_priv_hva(pt_gpa - fx_priv.gpa_base);
+    pt[i1] = (pa & FX_X86_ADDR_MASK) | leaf_flags | FX_X86_PTE_PRESENT;
+    return true;
+}
+
+static bool fx_shadow_map_2m(uint64_t root_gpa, bool la57, uint64_t va, uint64_t pa, uint64_t leaf_flags)
+{
+    uint16_t i5 = (va >> 48) & 0x1ff;
+    uint16_t i4 = (va >> 39) & 0x1ff;
+    uint16_t i3 = (va >> 30) & 0x1ff;
+    uint16_t i2 = (va >> 21) & 0x1ff;
+
+    uint64_t pml4_gpa = root_gpa;
+    if (la57) {
+        uint64_t tmp;
+        if (!fx_pt_get_next(root_gpa, i5, true, FX_PTE_W, &tmp)) return false;
+        pml4_gpa = tmp;
+    }
+
+    uint64_t pdpt_gpa, pd_gpa;
+    if (!fx_pt_get_next(pml4_gpa, i4, true, FX_PTE_W, &pdpt_gpa)) return false;
+    if (!fx_pt_get_next(pdpt_gpa, i3, true, FX_PTE_W, &pd_gpa)) return false;
+
+    uint64_t *pd = (uint64_t *)fx_priv_hva(pd_gpa - fx_priv.gpa_base);
+    pd[i2] = (pa & 0x000fffffffe00000ULL) | leaf_flags | FX_X86_PTE_PRESENT | FX_X86_PTE_PS;
+    return true;
+}
+
+static bool fx_build_shadow_pt(uint64_t *out_cr3_gpa)
+{
+    bool la57 = (fx_bootstrap_info.la57 != 0);
+    fx_priv_reset_allocator();
+
+    uint64_t root_gpa = 0;
+    if (!fx_priv_alloc_pt_page(&root_gpa)) {
+        return false;
+    }
+
+    /* Map private code/stack/mailbox */
+    uint64_t code_flags = FX_PTE_W;
+    uint64_t data_flags = FX_PTE_W | FX_X86_PTE_NX;
+
+    for (uint64_t off = 0; off < 0x4000; off += 0x1000) {
+        if (!fx_shadow_map_4k(root_gpa, la57, FX_PRIV_VA_CODE + off,
+                              fx_priv_gpa(FX_PRIV_CODE_OFF + off), code_flags)) {
+            return false;
+        }
+    }
+
+    for (uint64_t off = 0; off < FX_STACK_TOP_OFF; off += 0x1000) {
+        if (!fx_shadow_map_4k(root_gpa, la57, FX_PRIV_VA_STACK + off,
+                              fx_priv_gpa(FX_PRIV_STACK_OFF + off), data_flags)) {
+            return false;
+        }
+    }
+
+    for (uint64_t off = 0; off < FX_OUTBUF_SIZE; off += 0x1000) {
+        if (!fx_shadow_map_4k(root_gpa, la57, FX_PRIV_VA_MAIL + off,
+                              fx_priv_gpa(FX_PRIV_MAIL_OFF + off), data_flags)) {
+            return false;
+        }
+    }
+
+    /* Map physmap with 2MB pages */
+    uint64_t pm_base = fx_bootstrap_info.physmap_base_va;
+    uint64_t pm_size = fx_bootstrap_info.physmap_size;
+    if (!pm_base || !pm_size) {
+        fprintf(stderr, "[FX]: shadow PT: missing physmap_base/size\n");
+        fflush(stderr);
+        return false;
+    }
+
+    const uint64_t step = 2ULL * 1024 * 1024;
+    uint64_t limit = pm_size & ~(step - 1);
+    for (uint64_t pa = 0; pa < limit; pa += step) {
+        uint64_t va = pm_base + pa;
+        if (!fx_shadow_map_2m(root_gpa, la57, va, pa, FX_PTE_W | FX_X86_PTE_NX)) {
+            fprintf(stderr, "[FX]: shadow PT: physmap map failed at pa=0x%llx\n",
+                    (unsigned long long)pa);
+            fflush(stderr);
+            return false;
+        }
+    }
+
+    /* Map kernel text range VA->PA (RX) */
+    if (fx_bootstrap_info.kernel_text_va && fx_bootstrap_info.kernel_text_pa &&
+        fx_bootstrap_info.kernel_end_va > fx_bootstrap_info.kernel_text_va) {
+        uint64_t kva = fx_bootstrap_info.kernel_text_va & ~(step - 1);
+        uint64_t kpa = fx_bootstrap_info.kernel_text_pa & ~(step - 1);
+        uint64_t kend = (fx_bootstrap_info.kernel_end_va + step - 1) & ~(step - 1);
+        for (; kva < kend; kva += step, kpa += step) {
+            if (!fx_shadow_map_2m(root_gpa, la57, kva, kpa, 0 /* RX */)) {
+                fprintf(stderr, "[FX]: shadow PT: kernel map failed at va=0x%llx\n",
+                        (unsigned long long)kva);
+                fflush(stderr);
+                return false;
+            }
+        }
+    }
+
+    *out_cr3_gpa = root_gpa;
+    return true;
+}
 
 
 /* Start takeover on the current vCPU (target) */
@@ -3584,56 +3801,10 @@ static int fx_start_takeover(CPUState *cpu)
     struct kvm_regs  regs;
     struct kvm_sregs sregs;
     struct kvm_fpu   fpu;
-    uint64_t code_va_base;
-    uint64_t stack_va_base;
+    uint64_t shadow_cr3_gpa = 0;
 
-
-
-
-    /* Vault parameters must be set */
-    if (fx_code_gpa_base == 0 || fx_stack_gpa_base == 0) {
-        fprintf(stderr, "[FX]: invalid vault params (code_gpa=0x%llx code_size=0x%llx stack_gpa=0x%llx stack_size=0x%llx)\n",
-                (unsigned long long)fx_code_gpa_base,
-                (unsigned long long)fx_code_size,
-                (unsigned long long)fx_stack_gpa_base,
-                (unsigned long long)fx_stack_size);
-        fflush(stderr);
-        fx_armed = 0;
-        return 0;
-    }
-
-       /*
-     * execute from the kernel direct map (physmap) without
-     * switching CR3 and without building custom page tables.
-     *
-     * VA = physmap_base + PA (guest-physical == GPA in this context).
-     */
     if (!fx_bootstrap_valid) {
         fprintf(stderr, "[FX]: bootstrap not valid, refusing takeover\n");
-         fflush(stderr);
-         fx_armed = 0;
-         return 0;
-     }
- 
-    if (fx_bootstrap_info.physmap_base_va == 0) {
-        fprintf(stderr, "[FX]: physmap base (page_offset) missing/zero\n");
-        fflush(stderr);
-        fx_armed = 0;
-        return 0;
-    }
-
-    /* Ensure CODE and STACK vaults are large enough for the layout. */
-    if (fx_code_size < 0x1000) {
-        fprintf(stderr, "[FX]: code vault too small (size=0x%llx)\n",
-                (unsigned long long)fx_code_size);
-        fflush(stderr);
-        fx_armed = 0;
-        return 0;
-    }
-    if (fx_stack_size < FX_STACK_TOP_OFF) {
-        fprintf(stderr, "[FX]: stack vault too small (size=0x%llx need>=0x%llx)\n",
-                (unsigned long long)fx_stack_size,
-                (unsigned long long)FX_STACK_TOP_OFF);
         fflush(stderr);
         fx_armed = 0;
         return 0;
@@ -3694,28 +3865,28 @@ static int fx_start_takeover(CPUState *cpu)
      *
      * NOTE: We patch the guest page tables (single entry) and restore on exit.
      */
-    if (!fx_bootstrap_valid || fx_bootstrap_info.physmap_base_va == 0) {
-        fprintf(stderr, "[FX]: NX patch: missing bootstrap/page_offset, refusing takeover\n");
+    if (!fx_priv_map_enable()) {
+        fprintf(stderr, "[FX]: cannot enable private region mapping\n");
         fflush(stderr);
-        fx_resume_others();
         fx_saved.valid = 0;
+        fx_resume_others();
+        fx_armed = 0;
         return 0;
     }
 
-    /* Compute CODE/STACK VA inside physmap (direct map). */
-    code_va_base  = fx_bootstrap_info.physmap_base_va + fx_code_gpa_base;
-    stack_va_base = fx_bootstrap_info.physmap_base_va + fx_stack_gpa_base;
-
-
-    if (!fx_clear_nx_for_va(fx_saved.sregs.cr3, code_va_base,
-                                  (fx_bootstrap_info.la57 != 0),
-                                  &fx_saved)) {
-        fprintf(stderr, "[FX]: NX patch failed, aborting takeover\n");
+    if (!fx_build_shadow_pt(&shadow_cr3_gpa)) {
+        fprintf(stderr, "[FX]: failed to build shadow page tables\n");
         fflush(stderr);
-        fx_resume_others();
+        fx_priv_map_disable();
         fx_saved.valid = 0;
+        fx_resume_others();
+        fx_armed = 0;
         return 0;
     }
+
+    sregs.cr3 = shadow_cr3_gpa;
+    kvm_vcpu_ioctl(cpu, KVM_SET_SREGS, &sregs);
+
     /* === pass ABI registers to payload === */
     regs.rdi = fx_bootstrap_info.init_task_addr;
     regs.rsi = (uint64_t)fx_bootstrap_info.off_tasks;
@@ -3723,15 +3894,15 @@ static int fx_start_takeover(CPUState *cpu)
     regs.rcx = (uint64_t)fx_bootstrap_info.off_comm;
     regs.r8  = (uint64_t)fx_bootstrap_info.comm_len;
 
-    /* R9 MUST be a VA that is RW: use STACK vault direct-map VA + outbuf offset */
-    regs.r9  = stack_va_base + FX_OUTBUF_OFF;
+    /* R9 points to hyper-owned mailbox VA */
+    regs.r9  = FX_PRIV_VA_MAIL + FX_OUTBUF_OFF;
 
     /* magic port in r10w (write full r10 is fine) */
     regs.r10 = (uint64_t)FX_MAGIC_PORT_DONE;
 
-    /* Set RIP/RSP within the temporary mapping */
-    regs.rip = code_va_base + FX_ENTRY_OFF;
-    regs.rsp = stack_va_base + FX_STACK_TOP_OFF - 0x10;
+    /* Set RIP/RSP within hyper-owned private mapping */
+    regs.rip = FX_PRIV_VA_CODE + FX_ENTRY_OFF;
+    regs.rsp = FX_PRIV_VA_STACK + FX_STACK_TOP_OFF - 0x10;
 
     /* Disable interrupts during vault CR3 */
     regs.rflags &= ~X86_EFLAGS_IF;
@@ -3750,11 +3921,6 @@ static void fx_finish_takeover(CPUState *cpu)
         return;
     }
 
-    /*
-     * Restore NX before resuming guest execution.
-     * This keeps the direct-map NX mitigation intact outside the window.
-     */
-    fx_restore_nx(&fx_saved);
 
     /*
      * Restore order:
@@ -3787,8 +3953,11 @@ static void fx_finish_takeover(CPUState *cpu)
 
     fx_saved.valid = 0;
 
+     
+    /* Remove private mapping from EPT outside the window */
+    fx_priv_map_disable();
     fx_resume_others();
-
+    /* Signal FX device that the monitoring window completed successfully */
     fx_detach_req = 1;
 
 }
