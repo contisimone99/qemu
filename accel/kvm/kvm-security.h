@@ -75,7 +75,20 @@ typedef struct FxBootstrapInfo {
 
     /* sanity / constants */
     uint64_t init_task_pa;
-    uint64_t page_offset;
+    uint64_t physmap_base_va;
+
+    /* guest memory size hint (for mapping physmap fully) */
+    uint64_t physmap_size;        /* max_pfn << PAGE_SHIFT (best effort) */
+
+    /* kernel image mapping (VA->PA without guest page tables) */
+    uint64_t kernel_text_va;      /* _stext VA */
+    uint64_t kernel_text_pa;     // _stext PA (phys_base + offset)
+    uint64_t kernel_end_va;       /* _end VA */
+
+    /* vmalloc area range */
+    uint64_t vmalloc_start;
+    uint64_t vmalloc_end;
+ 
 
     uint32_t task_struct_size;
 } __attribute__((packed)) FxBootstrapInfo;
@@ -103,13 +116,23 @@ extern bool fx_bootstrap_valid;
 #define FX_OUTBUF_OFF          0x0000ULL
 #define FX_OUTBUF_SIZE         0x10000ULL   /* 64KB output buffer */
 
+/* === host-private region layout (shared with fx.c) === */
+#define FX_PRIV_CODE_OFF   0x200000ULL
+#define FX_PRIV_STACK_OFF  0x210000ULL
+#define FX_PRIV_MAIL_OFF   0x220000ULL
+
+
 
 /* Export used by kvm-all.c on DONE to print mailbox */
 void fx_dump_mailbox_from_kvmall(void);
 uint32_t fx_get_comm_len_from_kvmall(void);
 
+/* Host-private region helpers (implemented in kvm-all.c) */
+bool fx_priv_write_payload(const void *buf, size_t len);
+void *fx_priv_get_hva(uint64_t off, uint64_t len);
 
-#ifndef X86_EFLAGS_IF
+
+#ifndef X76_EFLAGS_IF
 #define X86_EFLAGS_IF (1ULL << 9)
 #endif
 
@@ -158,10 +181,6 @@ uint32_t fx_get_comm_len_from_kvmall(void);
  * They live in kvm-all so that the vCPU thread can run takeover without
  * additional plumbing.
  */
-uint64_t fx_code_gpa_base  = 0;
-uint64_t fx_code_size      = 0;
-uint64_t fx_stack_gpa_base = 0;
-uint64_t fx_stack_size     = 0;
 volatile int fx_armed      = 0;
 
 /* Request from KVM side to detach vault after step completion */
@@ -204,8 +223,7 @@ static FxSaved fx_saved = {0};
 
 /* Forward decl: implemented in fx device (fx.c) */
 void fx_vault_detach_from_kvmall(void);
-extern void fx_arm_from_kvmall(void);
-
+ 
 
 
 #endif
